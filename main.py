@@ -820,6 +820,292 @@ def _extraer_respuesta_segura(contexto_extra: str) -> Optional[str]:
 
     return None
 
+# ─────────────────────────────────────────────────────────────
+# Estado comercial prioritario
+# ─────────────────────────────────────────────────────────────
+
+def _normalizar_intencion(texto: str) -> str:
+    """
+    Normaliza texto corto para interpretar confirmaciones,
+    cierres y respuestas comerciales simples.
+
+    No se usa para catálogo. Solo para control de flujo.
+    """
+    t = (texto or "").lower().strip()
+    reemplazos = {
+        "á": "a",
+        "é": "e",
+        "í": "i",
+        "ó": "o",
+        "ú": "u",
+        "ñ": "n",
+    }
+
+    for origen, destino in reemplazos.items():
+        t = t.replace(origen, destino)
+
+    t = re.sub(r"\s+", " ", t)
+    return t.strip(" .,!¡¿?")
+
+
+def _es_confirmacion_afirmativa(texto: str) -> bool:
+    """
+    Detecta respuestas afirmativas del cliente.
+
+    Aplica para confirmar producto sugerido, no para buscar catálogo.
+    """
+    t = _normalizar_intencion(texto)
+
+    afirmaciones_exactas = {
+        "si",
+        "correcto",
+        "ese",
+        "esa",
+        "ese me sirve",
+        "esa me sirve",
+        "me sirve",
+        "sirve",
+        "ok",
+        "dale",
+        "perfecto",
+        "confirmo",
+        "confirmado",
+    }
+
+    return t in afirmaciones_exactas
+
+
+def _es_confirmacion_negativa(texto: str) -> bool:
+    """
+    Detecta rechazo del producto sugerido.
+    """
+    t = _normalizar_intencion(texto)
+
+    negativas_exactas = {
+        "no",
+        "no me sirve",
+        "no es",
+        "no corresponde",
+        "otro",
+        "otra",
+        "diferente",
+    }
+
+    return t in negativas_exactas
+
+
+def _extraer_cantidad_solicitada(texto: str) -> Optional[int]:
+    """
+    Extrae una cantidad comercial cuando NIA está esperando cantidad.
+
+    Regla:
+    - Acepta cantidades razonables de 1 a 5 dígitos.
+    - No interpreta números largos como cantidad para evitar confundir NIT,
+      teléfonos o códigos.
+    """
+    if not texto:
+        return None
+
+    t = texto.lower().strip()
+
+    m = re.search(
+        r"\b(\d{1,5})\b\s*(und|unds|unidad|unidades|pieza|piezas|u)?\b",
+        t,
+        re.IGNORECASE,
+    )
+
+    if not m:
+        return None
+
+    try:
+        cantidad = int(m.group(1))
+    except ValueError:
+        return None
+
+    if cantidad <= 0:
+        return None
+
+    return cantidad
+
+
+def _asignar_cantidad_ultimo_producto(productos_acumulados: list, cantidad: int) -> None:
+    """
+    Asigna la cantidad al último producto acumulado que aún no tenga cantidad.
+    Si todos tienen cantidad, actualiza el último producto como decisión comercial.
+    """
+    if not productos_acumulados:
+        return
+
+    for item in reversed(productos_acumulados):
+        if not item.get("cantidad"):
+            item["cantidad"] = cantidad
+            return
+
+    productos_acumulados[-1]["cantidad"] = cantidad
+
+
+def _parece_nombre_simple(texto: str) -> Optional[str]:
+    """
+    Captura nombres escritos de forma directa, por ejemplo:
+    - Luis
+    - Luis Díaz
+    - Juan Carlos Pérez
+
+    No captura correos, números, NIT, frases de cierre ni solicitudes de producto.
+    """
+    if not texto:
+        return None
+
+    limpio = texto.strip(" ,.;:-")
+
+    if not limpio or EMAIL_RE.search(limpio) or NIT_RE.search(limpio):
+        return None
+
+    t = _normalizar_intencion(limpio)
+
+    bloqueados = PALABRAS_SALUDO | PALABRAS_FIN | {
+        "si",
+        "no",
+        "ok",
+        "dale",
+        "correcto",
+        "solo",
+        "eso",
+        "solo eso",
+        "cotiza",
+    }
+
+    if t in bloqueados:
+        return None
+
+    if _parece_solicitud_de_producto(limpio):
+        return None
+
+    partes = limpio.split()
+
+    if not (1 <= len(partes) <= 4):
+        return None
+
+    patron_nombre = re.compile(r"^[A-Za-zÁÉÍÓÚáéíóúÑñüÜ'-]{2,}$")
+
+    if not all(patron_nombre.match(p) for p in partes):
+        return None
+
+    return " ".join(p.capitalize() for p in partes)
+
+
+def _parece_empresa_simple(texto: str) -> Optional[str]:
+    """
+    Captura razón social escrita de forma directa cuando NIA está en etapa proforma.
+
+    Ejemplos:
+    - ViaIndustrial SAS
+    - Equipos Industriales Fenix S.A.S
+    - Industrias ABC
+    """
+    if not texto:
+        return None
+
+    limpio = texto.strip(" ,.;:-")
+
+    if not limpio or EMAIL_RE.search(limpio) or NIT_RE.search(limpio):
+        return None
+
+    if _es_confirmacion_afirmativa(limpio) or _es_confirmacion_negativa(limpio):
+        return None
+
+    if _parece_solicitud_de_producto(limpio):
+        return None
+
+    if len(limpio) < 3 or len(limpio) > 80:
+        return None
+
+    if not re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", limpio):
+        return None
+
+    return limpio
+
+
+def _capturar_dato_comercial_por_etapa(mensaje: str, cliente: dict, etapa: str) -> dict:
+    """
+    Completa datos comerciales según el estado actual de la conversación.
+
+    Esta función evita que datos como nombre, empresa o NIT sean tratados
+    como búsqueda de producto cuando NIA está cerrando una cotización.
+    """
+    cliente = dict(cliente or {})
+
+    # extraer_datos_cliente ya capturó email/NIT si venían explícitos.
+    # Aquí completamos casos escritos de forma directa.
+    if etapa in {"cotizacion", "calificacion", "confirmando_cierre"}:
+        if not cliente.get("nombre"):
+            nombre = _parece_nombre_simple(mensaje)
+            if nombre:
+                cliente["nombre"] = nombre
+                logger.debug("Nombre simple capturado por etapa: %s", nombre)
+
+    if etapa == "proforma":
+        if not cliente.get("empresa"):
+            empresa = _parece_empresa_simple(mensaje)
+            if empresa:
+                cliente["empresa"] = empresa
+                logger.debug("Empresa simple capturada por etapa: %s", empresa)
+
+    return cliente
+
+
+def _respuesta_siguiente_dato_comercial(cliente: dict) -> tuple[str, str]:
+    """
+    Decide cuál es el siguiente dato comercial faltante.
+
+    Orden profesional:
+    1. Nombre
+    2. Email
+    3. Razón social
+    4. NIT
+    5. Cierre listo para revisión de asesor
+    """
+    cliente = cliente or {}
+    nombre = cliente.get("nombre")
+
+    if not cliente.get("nombre"):
+        return "¿A nombre de quién va la cotización?", "cotizacion"
+
+    if not cliente.get("email"):
+        return f"Gracias, {nombre}. ¿Cuál es el correo electrónico para enviar la cotización?", "cotizacion"
+
+    if not cliente.get("empresa"):
+        return (
+            f"Perfecto, {nombre}. Para preparar la proforma, ¿cuál es la razón social de tu empresa?",
+            "proforma",
+        )
+
+    if not cliente.get("nit"):
+        return "Gracias. ¿Cuál es el NIT de la empresa?", "proforma"
+
+    return (
+    "Perfecto, ya tengo el producto, la cantidad y los datos básicos.\n\n"
+    "Voy a dejar la solicitud lista para que un asesor revise disponibilidad, precio y condiciones antes de continuar con la cotización.",
+    "cotizacion_lista",
+    )
+
+
+def _es_nueva_solicitud_durante_cierre(mensaje: str) -> bool:
+    """
+    Permite salir del flujo de cierre si el cliente realmente pide otro producto.
+
+    Ejemplo:
+    - también necesito una válvula
+    - agrega otro sensor
+    - necesito otro equipo
+    """
+    t = _normalizar_intencion(mensaje)
+
+    if any(p in t for p in {"tambien necesito", "tambien quiero", "agrega", "agregar", "otro producto", "otra referencia"}):
+        return True
+
+    return _parece_solicitud_de_producto(mensaje)
+
 
 # ─────────────────────────────────────────────────────────────
 # Núcleo conversacional
@@ -939,9 +1225,72 @@ async def procesar_turno(
 
     elif mensaje.strip():
         msg_lower = mensaje.lower().strip()
+        estado_comercial_resuelto = False
+
+        # ══════════════════════════════════════════════════════
+        # PRIORIDAD: ESTADO COMERCIAL
+        # ══════════════════════════════════════════════════════
+        # Antes de buscar catálogo, NIA debe respetar lo que estaba esperando:
+        # confirmación de producto, cantidad o datos para cotización/proforma.
+
+        if etapa == "producto_encontrado" and productos_acumulados:
+            if _es_confirmacion_afirmativa(mensaje):
+                contexto_extra = _marcar_respuesta_segura(
+                    "Perfecto. ¿Cuál es la cantidad que necesitas?"
+                )
+                nueva_etapa = "esperando_cantidad"
+                necesidad_ctx = {"esperando": "cantidad"}
+                estado_comercial_resuelto = True
+
+            elif _es_confirmacion_negativa(mensaje):
+                contexto_extra = _marcar_respuesta_segura(
+                    "Entendido. Para buscar una mejor opción, ¿puedes indicarme tipo de producto, aplicación, marca, referencia o especificación técnica requerida?"
+                )
+                nueva_etapa = "descubrimiento"
+                necesidad_ctx = {}
+                estado_comercial_resuelto = True
+
+        elif etapa == "esperando_cantidad":
+            cantidad = _extraer_cantidad_solicitada(mensaje)
+
+            if cantidad:
+                _asignar_cantidad_ultimo_producto(productos_acumulados, cantidad)
+
+                contexto_extra = _marcar_respuesta_segura(
+                    f"Listo, dejé la cantidad en {cantidad}. ¿Necesitas algo más o cotizamos con esto?"
+                )
+                nueva_etapa = "confirmando_cierre"
+                necesidad_ctx = {}
+                estado_comercial_resuelto = True
+
+            else:
+                contexto_extra = _marcar_respuesta_segura(
+                    "Para avanzar con la cotización necesito la cantidad en unidades. ¿Cuántas unidades necesitas?"
+                )
+                nueva_etapa = "esperando_cantidad"
+                necesidad_ctx = {"esperando": "cantidad"}
+                estado_comercial_resuelto = True
+
+        elif (
+            etapa in {"confirmando_cierre", "cotizacion", "calificacion", "proforma"}
+            and productos_acumulados
+            and not _es_nueva_solicitud_durante_cierre(mensaje)
+        ):
+            cliente = _capturar_dato_comercial_por_etapa(
+                mensaje=mensaje,
+                cliente=cliente,
+                etapa=etapa,
+            )
+
+            respuesta_dato, etapa_dato = _respuesta_siguiente_dato_comercial(cliente)
+
+            contexto_extra = _marcar_respuesta_segura(respuesta_dato)
+            nueva_etapa = etapa_dato
+            necesidad_ctx = {}
+            estado_comercial_resuelto = True
 
         # Caso 1: respuesta a ítem pendiente de archivo
-        if archivo_activo:
+        if not estado_comercial_resuelto and archivo_activo:
             pendientes = [
                 item for item in archivo_activo.get("items", [])
                 if item["estado"] in {"pendiente", "sin_resultado", "relacionado"}
@@ -1102,22 +1451,26 @@ async def procesar_turno(
                     nueva_etapa = "descubrimiento"
                     necesidad_ctx = {"texto_original": mensaje}
 
+       
         # Intenciones comerciales transversales
-        if any(w in msg_lower for w in PALABRAS_MAS):
-            nueva_etapa = "acumulando"
+        # Solo se aplican si el estado comercial prioritario no resolvió el turno.
+        # Esto evita que datos como cantidad, nombre, empresa o NIT sean tratados
+        # como nuevas búsquedas o cambien de etapa por accidente.
+        if not estado_comercial_resuelto:
+            if any(w in msg_lower for w in PALABRAS_MAS):
+                nueva_etapa = "acumulando"
 
-        elif any(w in msg_lower for w in PALABRAS_FIN):
-            nueva_etapa = "cotizacion"
+            elif any(w in msg_lower for w in PALABRAS_FIN):
+                nueva_etapa = "cotizacion"
 
-        elif "presupuesto" in msg_lower or "fecha" in msg_lower:
-            nueva_etapa = "calificacion"
+            elif "presupuesto" in msg_lower or "fecha" in msg_lower:
+                nueva_etapa = "calificacion"
 
-        elif "rut" in msg_lower or "proforma" in msg_lower:
-            nueva_etapa = "proforma"
+            elif "rut" in msg_lower or "proforma" in msg_lower:
+                nueva_etapa = "proforma"
 
-        elif "pago" in msg_lower or "pse" in msg_lower or "transferencia" in msg_lower:
-            nueva_etapa = "pago"
-
+            elif "pago" in msg_lower or "pse" in msg_lower or "transferencia" in msg_lower:
+                nueva_etapa = "pago"
     # ─────────────────────────────────────────────────────────
     # Construcción de contexto para LLM o respuesta segura
     # ─────────────────────────────────────────────────────────
@@ -1173,6 +1526,12 @@ async def procesar_turno(
     msg_llm = mensaje if mensaje.strip() else f"[Cliente envió archivo: {archivo_nombre}]"
 
     respuesta_segura = _extraer_respuesta_segura(contexto_extra)
+    
+    if nueva_etapa == "cotizacion_lista" and not respuesta_segura:
+        respuesta_segura = (
+            "Perfecto, ya tengo el producto, la cantidad y los datos básicos.\n\n"
+            "Voy a dejar la solicitud lista para que un asesor revise disponibilidad, precio y condiciones antes de continuar con la cotización."
+        )
 
     if respuesta_segura:
         respuesta = respuesta_segura
