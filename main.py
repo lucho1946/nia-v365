@@ -1233,7 +1233,7 @@ async def procesar_turno(
         # Antes de buscar catálogo, NIA debe respetar lo que estaba esperando:
         # confirmación de producto, cantidad o datos para cotización/proforma.
 
-        if etapa == "producto_encontrado" and productos_acumulados:
+        if etapa == "producto_encontrado":
             if _es_confirmacion_afirmativa(mensaje):
                 contexto_extra = _marcar_respuesta_segura(
                     "Perfecto. ¿Cuál es la cantidad que necesitas?"
@@ -1273,7 +1273,6 @@ async def procesar_turno(
 
         elif (
             etapa in {"confirmando_cierre", "cotizacion", "calificacion", "proforma"}
-            and productos_acumulados
             and not _es_nueva_solicitud_durante_cierre(mensaje)
         ):
             cliente = _capturar_dato_comercial_por_etapa(
