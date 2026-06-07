@@ -1106,7 +1106,220 @@ def _es_nueva_solicitud_durante_cierre(mensaje: str) -> bool:
 
     return _parece_solicitud_de_producto(mensaje)
 
+# ─────────────────────────────────────────────────────────────
+# Controlador determinístico de estado comercial
+# ─────────────────────────────────────────────────────────────
 
+ESTADOS_COMERCIALES = {
+    "producto_encontrado",
+    "esperando_cantidad",
+    "confirmando_cierre",
+    "cotizacion",
+    "calificacion",
+    "proforma",
+    "cotizacion_lista",
+}
+
+
+def _manejar_estado_comercial_prioritario(
+    etapa: str,
+    mensaje: str,
+    cliente: dict,
+    productos_acumulados: list,
+    necesidad_ctx: dict,
+) -> Optional[dict]:
+    """
+    Controla estados comerciales de forma determinística.
+
+    Regla central:
+    Si esta función resuelve el turno, procesar_turno debe retornar
+    inmediatamente sin buscar catálogo y sin llamar al LLM.
+
+    Esto evita que:
+    - una cantidad sea interpretada como código;
+    - un NIT sea interpretado como producto;
+    - un correo dispare búsqueda de catálogo;
+    - el LLM cambie una etapa comercial ya decidida.
+    """
+    etapa = etapa or "inicio"
+    mensaje = (mensaje or "").strip()
+    cliente = dict(cliente or {})
+    necesidad_ctx = dict(necesidad_ctx or {})
+    productos_acumulados = productos_acumulados or []
+
+    if not mensaje or etapa not in ESTADOS_COMERCIALES:
+        return None
+
+    # 1) Producto encontrado: NIA espera confirmación explícita.
+    if etapa == "producto_encontrado":
+        if _es_confirmacion_afirmativa(mensaje):
+            return {
+                "handled": True,
+                "respuesta": "Perfecto. ¿Cuál es la cantidad que necesitas?",
+                "etapa": "esperando_cantidad",
+                "cliente": cliente,
+                "necesidad_ctx": {"esperando": "cantidad"},
+                "productos_acumulados": productos_acumulados,
+            }
+
+        if _es_confirmacion_negativa(mensaje):
+            return {
+                "handled": True,
+                "respuesta": (
+                    "Entendido. Para buscar una mejor opción, ¿puedes indicarme "
+                    "tipo de producto, aplicación, marca, referencia o especificación técnica requerida?"
+                ),
+                "etapa": "descubrimiento",
+                "cliente": cliente,
+                "necesidad_ctx": {},
+                "productos_acumulados": productos_acumulados,
+            }
+
+        return {
+            "handled": True,
+            "respuesta": "¿Este producto cubre lo que necesitas? Puedes responder sí o no.",
+            "etapa": "producto_encontrado",
+            "cliente": cliente,
+            "necesidad_ctx": necesidad_ctx,
+            "productos_acumulados": productos_acumulados,
+        }
+
+    # 2) Esperando cantidad: un número corto es cantidad, no código.
+    if etapa == "esperando_cantidad":
+        cantidad = _extraer_cantidad_solicitada(mensaje)
+
+        if not cantidad:
+            return {
+                "handled": True,
+                "respuesta": "Para avanzar con la cotización necesito la cantidad en unidades. ¿Cuántas unidades necesitas?",
+                "etapa": "esperando_cantidad",
+                "cliente": cliente,
+                "necesidad_ctx": {"esperando": "cantidad"},
+                "productos_acumulados": productos_acumulados,
+            }
+
+        _asignar_cantidad_ultimo_producto(productos_acumulados, cantidad)
+
+        return {
+            "handled": True,
+            "respuesta": f"Listo, dejé la cantidad en {cantidad}. ¿Necesitas algo más o cotizamos con esto?",
+            "etapa": "confirmando_cierre",
+            "cliente": cliente,
+            "necesidad_ctx": {},
+            "productos_acumulados": productos_acumulados,
+        }
+
+    # 3) Confirmando cierre: por defecto sigue a datos comerciales.
+    # Solo sale a catálogo si el cliente claramente pide otro producto.
+    if etapa == "confirmando_cierre":
+        if _es_nueva_solicitud_durante_cierre(mensaje):
+            return None
+
+        cliente = _capturar_dato_comercial_por_etapa(
+            mensaje=mensaje,
+            cliente=cliente,
+            etapa=etapa,
+        )
+
+        respuesta_dato, etapa_dato = _respuesta_siguiente_dato_comercial(cliente)
+
+        return {
+            "handled": True,
+            "respuesta": respuesta_dato,
+            "etapa": etapa_dato,
+            "cliente": cliente,
+            "necesidad_ctx": {},
+            "productos_acumulados": productos_acumulados,
+        }
+
+    # 4) Cotización/proforma: capturar datos antes de cualquier búsqueda.
+    if etapa in {"cotizacion", "calificacion", "proforma"}:
+        if _es_nueva_solicitud_durante_cierre(mensaje):
+            return None
+
+        cliente = _capturar_dato_comercial_por_etapa(
+            mensaje=mensaje,
+            cliente=cliente,
+            etapa=etapa,
+        )
+
+        respuesta_dato, etapa_dato = _respuesta_siguiente_dato_comercial(cliente)
+
+        return {
+            "handled": True,
+            "respuesta": respuesta_dato,
+            "etapa": etapa_dato,
+            "cliente": cliente,
+            "necesidad_ctx": {},
+            "productos_acumulados": productos_acumulados,
+        }
+
+    # 5) Cierre seguro: no inventar cotización ni proforma automática.
+    if etapa == "cotizacion_lista":
+        return {
+            "handled": True,
+            "respuesta": (
+                "Perfecto, ya tengo el producto, la cantidad y los datos básicos.\n\n"
+                "Voy a dejar la solicitud lista para que un asesor revise disponibilidad, "
+                "precio y condiciones antes de continuar con la cotización."
+            ),
+            "etapa": "cotizacion_lista",
+            "cliente": cliente,
+            "necesidad_ctx": {},
+            "productos_acumulados": productos_acumulados,
+        }
+
+    return None
+
+
+async def _guardar_y_responder_turno(
+    session_id: str,
+    phone_id: Optional[str],
+    historial: list,
+    mensaje_usuario: str,
+    respuesta: str,
+    etapa: str,
+    cliente: dict,
+    productos_acumulados: list,
+    necesidad_ctx: Optional[dict] = None,
+    archivo_activo: Optional[dict] = None,
+    items_resultado: Optional[list] = None,
+) -> dict:
+    """
+    Guarda sesión y retorna respuesta final sin pasar por LLM.
+
+    Se usa cuando un estado comercial ya resolvió el turno.
+    """
+    turno_user = {
+        "role": "user",
+        "content": mensaje_usuario,
+        "ts": datetime.utcnow().isoformat(),
+    }
+
+    turno_nia = {
+        "role": "assistant",
+        "content": respuesta,
+        "ts": datetime.utcnow().isoformat(),
+    }
+
+    await save_session(
+        session_id=session_id,
+        phone_id=phone_id,
+        turnos=historial + [turno_user, turno_nia],
+        etapa=etapa,
+        archivo_activo=archivo_activo,
+        necesidad_ctx=necesidad_ctx or {},
+        cliente=cliente or {},
+        productos_acumulados=productos_acumulados or [],
+    )
+
+    return {
+        "respuesta": respuesta,
+        "etapa": etapa,
+        "items_resultado": items_resultado or None,
+        "cliente": cliente or None,
+    }
+    
 # ─────────────────────────────────────────────────────────────
 # Núcleo conversacional
 # ─────────────────────────────────────────────────────────────
@@ -1139,6 +1352,42 @@ async def procesar_turno(
 
     if mensaje.strip():
         cliente = extraer_datos_cliente(mensaje, cliente)
+        
+    # ══════════════════════════════════════════════════════
+    # PRIORIDAD ABSOLUTA: ESTADO COMERCIAL
+    # ══════════════════════════════════════════════════════
+    # Si el turno pertenece a una etapa comercial, se resuelve aquí
+    # y se retorna inmediatamente. No catálogo. No LLM. No reglas posteriores.
+    if mensaje.strip() and not (archivo_bytes and archivo_nombre):
+        comercial = _manejar_estado_comercial_prioritario(
+            etapa=etapa,
+            mensaje=mensaje,
+            cliente=cliente,
+            productos_acumulados=productos_acumulados,
+            necesidad_ctx=necesidad_ctx,
+        )
+
+        if comercial and comercial.get("handled"):
+            logger.info(
+                "Turno resuelto por estado comercial: session=%s etapa=%s -> %s",
+                session_id,
+                etapa,
+                comercial["etapa"],
+            )
+
+            return await _guardar_y_responder_turno(
+                session_id=session_id,
+                phone_id=phone_id,
+                historial=historial,
+                mensaje_usuario=mensaje,
+                respuesta=comercial["respuesta"],
+                etapa=comercial["etapa"],
+                cliente=comercial["cliente"],
+                productos_acumulados=comercial["productos_acumulados"],
+                necesidad_ctx=comercial.get("necesidad_ctx", {}),
+                archivo_activo=archivo_activo,
+                items_resultado=None,
+            )
 
     # ══════════════════════════════════════════════════════
     # MODO ARCHIVO
@@ -1226,70 +1475,12 @@ async def procesar_turno(
     elif mensaje.strip():
         msg_lower = mensaje.lower().strip()
         estado_comercial_resuelto = False
-
-        # ══════════════════════════════════════════════════════
-        # PRIORIDAD: ESTADO COMERCIAL
-        # ══════════════════════════════════════════════════════
-        # Antes de buscar catálogo, NIA debe respetar lo que estaba esperando:
-        # confirmación de producto, cantidad o datos para cotización/proforma.
-
-        if etapa == "producto_encontrado":
-            if _es_confirmacion_afirmativa(mensaje):
-                contexto_extra = _marcar_respuesta_segura(
-                    "Perfecto. ¿Cuál es la cantidad que necesitas?"
-                )
-                nueva_etapa = "esperando_cantidad"
-                necesidad_ctx = {"esperando": "cantidad"}
-                estado_comercial_resuelto = True
-
-            elif _es_confirmacion_negativa(mensaje):
-                contexto_extra = _marcar_respuesta_segura(
-                    "Entendido. Para buscar una mejor opción, ¿puedes indicarme tipo de producto, aplicación, marca, referencia o especificación técnica requerida?"
-                )
-                nueva_etapa = "descubrimiento"
-                necesidad_ctx = {}
-                estado_comercial_resuelto = True
-
-        elif etapa == "esperando_cantidad":
-            cantidad = _extraer_cantidad_solicitada(mensaje)
-
-            if cantidad:
-                _asignar_cantidad_ultimo_producto(productos_acumulados, cantidad)
-
-                contexto_extra = _marcar_respuesta_segura(
-                    f"Listo, dejé la cantidad en {cantidad}. ¿Necesitas algo más o cotizamos con esto?"
-                )
-                nueva_etapa = "confirmando_cierre"
-                necesidad_ctx = {}
-                estado_comercial_resuelto = True
-
-            else:
-                contexto_extra = _marcar_respuesta_segura(
-                    "Para avanzar con la cotización necesito la cantidad en unidades. ¿Cuántas unidades necesitas?"
-                )
-                nueva_etapa = "esperando_cantidad"
-                necesidad_ctx = {"esperando": "cantidad"}
-                estado_comercial_resuelto = True
-
-        elif (
-            etapa in {"confirmando_cierre", "cotizacion", "calificacion", "proforma"}
-            and not _es_nueva_solicitud_durante_cierre(mensaje)
-        ):
-            cliente = _capturar_dato_comercial_por_etapa(
-                mensaje=mensaje,
-                cliente=cliente,
-                etapa=etapa,
-            )
-
-            respuesta_dato, etapa_dato = _respuesta_siguiente_dato_comercial(cliente)
-
-            contexto_extra = _marcar_respuesta_segura(respuesta_dato)
-            nueva_etapa = etapa_dato
-            necesidad_ctx = {}
-            estado_comercial_resuelto = True
+        
+        # El estado comercial se resuelve antes de entrar al modo texto.
+        # Si llegó hasta aquí, este turno puede pasar a archivo/catálogo/LLM.
 
         # Caso 1: respuesta a ítem pendiente de archivo
-        if not estado_comercial_resuelto and archivo_activo:
+        if archivo_activo:
             pendientes = [
                 item for item in archivo_activo.get("items", [])
                 if item["estado"] in {"pendiente", "sin_resultado", "relacionado"}
@@ -1455,7 +1646,7 @@ async def procesar_turno(
         # Solo se aplican si el estado comercial prioritario no resolvió el turno.
         # Esto evita que datos como cantidad, nombre, empresa o NIT sean tratados
         # como nuevas búsquedas o cambien de etapa por accidente.
-        if not estado_comercial_resuelto:
+        if True:
             if any(w in msg_lower for w in PALABRAS_MAS):
                 nueva_etapa = "acumulando"
 
