@@ -613,6 +613,26 @@ async def buscar_en_catalogo(texto: str) -> dict:
             "query_catalogo": query_usada,
         }
 
+        # Si el producto es relacionado, NIA no debe tomarlo como solución exacta.
+        # Generamos hasta 3 preguntas técnicas para validar compatibilidad real
+        # usando questions_agent.py + product_fields.py.
+        preguntas_tecnicas = []
+
+        try:
+            preguntas_tecnicas = await generar_preguntas(texto)
+        except Exception as e:
+            logger.warning(
+                "No fue posible generar preguntas técnicas para producto relacionado: %s",
+                e,
+            )
+            preguntas_tecnicas = []
+
+        preguntas_limpias = [
+            p.strip()
+            for p in preguntas_tecnicas
+            if isinstance(p, str) and p.strip()
+        ][:3]
+
         return {
             "estado": "relacionado",
             "producto": producto,
@@ -622,6 +642,8 @@ async def buscar_en_catalogo(texto: str) -> dict:
             "pregunta_sugerida": decision.get("pregunta_sugerida"),
             "query_catalogo": query_usada,
             "candidatos_encontrados": True,
+            "texto_original": texto,
+            "preguntas_tecnicas": preguntas_limpias,
         }
 
     return {
@@ -769,22 +791,48 @@ def construir_respuesta_desde_resultado(
     if estado == "relacionado" and res.get("producto"):
         producto = res["producto"]
 
+        # Esta función es síncrona, por eso aquí NO usamos await.
+        # Si existen preguntas técnicas, deben venir preparadas desde
+        # buscar_en_catalogo(), que sí es async.
+        preguntas_tecnicas = res.get("preguntas_tecnicas") or []
+
+        respuesta_base = respuesta_producto_relacionado(
+            producto=producto,
+            razon=res.get("razon"),
+            pregunta_sugerida=res.get("pregunta_sugerida"),
+            cliente=cliente,
+        )
+
+        preguntas_limpias = [
+            p.strip()
+            for p in preguntas_tecnicas
+            if isinstance(p, str) and p.strip()
+        ][:3]
+
+        if preguntas_limpias:
+            bloque_preguntas = "\n".join(
+                f"{i + 1}. {pregunta}"
+                for i, pregunta in enumerate(preguntas_limpias)
+            )
+
+            respuesta = (
+                f"{respuesta_base}\n\n"
+                "Para validar mejor la solución, necesito confirmar:\n"
+                f"{bloque_preguntas}"
+            )
+        else:
+            respuesta = respuesta_base
+
         necesidad_ctx = {
             **necesidad_ctx_base,
             "producto_relacionado": producto,
             "pregunta_sugerida": res.get("pregunta_sugerida"),
             "razon": res.get("razon"),
+            "preguntas_tecnicas": preguntas_limpias,
         }
 
         return (
-            _marcar_respuesta_segura(
-                respuesta_producto_relacionado(
-                    producto=producto,
-                    razon=res.get("razon"),
-                    pregunta_sugerida=res.get("pregunta_sugerida"),
-                    cliente=cliente,
-                )
-            ),
+            _marcar_respuesta_segura(respuesta),
             "validando_relacionado",
             necesidad_ctx,
         )
