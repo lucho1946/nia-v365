@@ -430,10 +430,387 @@ async def buscar_por_texto(query: str) -> Optional[list]:
 
     return normalizados
 
+async def buscar_con_campos(texto: str) -> Tuple[Optional[list], dict]:
+    """
+    Búsqueda técnica sobre MongoDB.
+
+    Objetivo:
+    - Extraer campos técnicos del mensaje del cliente.
+    - Generar consultas limpias para el catálogo.
+    - Mantener MongoDB como fuente oficial.
+    - No depender de API externa.
+    - No usar listas cerradas de productos o marcas.
+
+    Importante:
+    Esta función NO decide compatibilidad final.
+    Solo recupera candidatos y entrega campos_query para scoring.
+    """
+    texto_original = _clean_text(texto)
+
+    if not texto_original:
+        return None, {}
+
+    campos_query = _extraer_campos_query(texto_original)
+
+    def _normalizar_query_catalogo(valor: str) -> str:
+        """
+        Limpia una frase conversacional y deja términos útiles de búsqueda.
+
+        Esto no es una lista de productos. Son palabras funcionales genéricas
+        del lenguaje que no aportan al catálogo.
+        """
+        valor_norm = _normalize_text(valor)
+
+        # Quitamos valores técnicos ya detectados para que no dominen
+        # la búsqueda textual.
+        for campo_valor in campos_query.values():
+            campo_valor_norm = _normalize_text(str(campo_valor))
+            if campo_valor_norm:
+                valor_norm = valor_norm.replace(campo_valor_norm, " ")
+
+        tokens = [
+            token
+            for token in valor_norm.split()
+            if len(token) > 2
+            and token not in {
+                "necesito",
+                "necesitamos",
+                "quiero",
+                "requiere",
+                "requiero",
+                "buscar",
+                "busco",
+                "para",
+                "con",
+                "una",
+                "uno",
+                "del",
+                "los",
+                "las",
+                "que",
+                "por",
+                "favor",
+                "equipo",
+                "producto",
+                "sistema",
+                "proceso",
+            }
+        ]
+
+        return " ".join(tokens).strip()
+
+    queries = []
+
+    # 1. Consulta limpia principal.
+    query_limpia = _normalizar_query_catalogo(texto_original)
+
+    if query_limpia:
+        queries.append(query_limpia)
+
+    # 2. Consulta original como fallback.
+    if texto_original and texto_original not in queries:
+        queries.append(texto_original)
+
+    # 3. Consulta corta con los primeros términos útiles.
+    if query_limpia:
+        tokens_base = query_limpia.split()[:4]
+        query_base = " ".join(tokens_base).strip()
+
+        if query_base and query_base not in queries:
+            queries.append(query_base)
+
+    # 4. Consulta técnica como último fallback.
+    if campos_query and query_limpia:
+        valores_tecnicos = [
+            str(v).strip()
+            for v in campos_query.values()
+            if isinstance(v, str) and str(v).strip()
+        ]
+
+        if valores_tecnicos:
+            query_tecnica = f"{query_limpia} {' '.join(valores_tecnicos[:2])}".strip()
+
+            if query_tecnica and query_tecnica not in queries:
+                queries.append(query_tecnica)
+
+    logger.info(
+        "buscar_con_campos texto='%s' campos=%s queries=%s",
+        texto_original,
+        campos_query,
+        queries,
+    )
+
+    for query in queries:
+        resultados = await buscar_por_texto(query)
+
+        if resultados:
+            logger.info(
+                "buscar_con_campos encontró %s resultados con query='%s'",
+                len(resultados),
+                query,
+            )
+            return resultados, campos_query
+
+    logger.info(
+        "buscar_con_campos sin resultados texto='%s' queries=%s",
+        texto_original,
+        queries,
+    )
+
+    return None, campos_query
 
 # ============================================================
 # SCORING
 # ============================================================
+def _parsear_campos(desc_larga: str) -> dict:
+    """
+    Extrae campos estructurados desde descripcion_larga.
+
+    Formato esperado en catálogo:
+    ¦ campo: valor ¦ campo: valor
+
+    Ejemplo:
+    ¦ rango: 0 a 10 bar ¦ salida: 4-20 mA ¦ conexion: 1/2 NPT
+    """
+    campos = {}
+
+    if not desc_larga or "¦" not in desc_larga:
+        return campos
+
+    for parte in str(desc_larga).split("¦"):
+        parte = parte.strip()
+
+        if ":" not in parte:
+            continue
+
+        campo, valor = parte.split(":", 1)
+        campo = _normalize_text(campo)
+        valor = str(valor).strip()
+
+        if 2 < len(campo) < 50 and valor:
+            campos[campo] = valor
+
+    return campos
+
+
+def _score_campos_estructurados(
+    campos_producto: dict,
+    campos_query: dict,
+) -> float:
+    """
+    Compara campos técnicos detectados en la consulta del cliente contra
+    campos estructurados presentes en la descripción larga del producto.
+
+    Retorna un promedio entre 0.0 y 1.0.
+    """
+    if not campos_producto or not campos_query:
+        return 0.0
+
+    scores = []
+
+    for campo_q, valor_q in campos_query.items():
+        campo_q_norm = _normalize_text(campo_q)
+        valor_q_norm = _normalize_text(valor_q)
+
+        if not campo_q_norm or not valor_q_norm:
+            continue
+
+        for campo_p, valor_p in campos_producto.items():
+            campo_p_norm = _normalize_text(campo_p)
+            valor_p_norm = _normalize_text(valor_p)
+
+            # Coincidencia flexible de nombre de campo.
+            # Ejemplo: "salida" puede coincidir con "señal de salida".
+            if campo_q_norm in campo_p_norm or campo_p_norm in campo_q_norm:
+                scores.append(_sim(valor_q_norm, valor_p_norm))
+                break
+
+    if not scores:
+        return 0.0
+
+    return sum(scores) / len(scores)
+
+def _extraer_campos_query(texto: str) -> dict:
+    """
+    Extrae valores técnicos desde el mensaje del cliente usando patrones generales.
+
+    Regla de diseño:
+    - No depende de listas cerradas de materiales, marcas o protocolos.
+    - Detecta estructuras comunes: rangos, unidades, conexión, salida/señal,
+      material declarado, protección IP y voltaje.
+    - No reemplaza al product_matcher; solo aporta contexto técnico para mejorar scoring.
+    """
+    campos = {}
+    t_original = _clean_text(texto)
+    t = t_original.lower()
+
+    # ------------------------------------------------------------
+    # 1. Rangos numéricos con unidades técnicas
+    # Ejemplos:
+    # - 0 a 10 bar
+    # - 0-100 psi
+    # - 10 a 80 °C
+    # - 50 l/min
+    # ------------------------------------------------------------
+    rango = re.search(
+        r"(\d+[\.,]?\d*)\s*(?:a|-|hasta)\s*(\d+[\.,]?\d*)\s*"
+        r"([a-zA-Z°/%\.]+(?:/[a-zA-Z]+)?)",
+        t,
+        re.IGNORECASE,
+    )
+
+    if rango:
+        inicio, fin, unidad = rango.groups()
+        campos["rango"] = f"{inicio} a {fin} {unidad}"
+
+    # Valor único con unidad cuando no hay rango.
+    # Ejemplo: 80 C, 24 VDC, 50 l/min, 10 bar.
+    valor_unico = re.search(
+        r"\b(\d+[\.,]?\d*)\s*"
+        r"(bar|psi|mbar|kpa|mpa|pa|°c|°f|c|f|v|vac|vdc|ma|a|gpm|lpm|l/min|m3/h|hz)\b",
+        t,
+        re.IGNORECASE,
+    )
+
+    if valor_unico and "rango" not in campos:
+        valor, unidad = valor_unico.groups()
+        unidad_norm = unidad.upper() if unidad in ["c", "f"] else unidad
+        campos["valor_tecnico"] = f"{valor} {unidad_norm}"
+
+    # ------------------------------------------------------------
+    # 2. Señal / salida / comunicación / protocolo
+    # Extrae lo que venga después de palabras técnicas.
+    # Ejemplos:
+    # - salida 4-20 mA
+    # - señal 0-10 V
+    # - protocolo Modbus RTU
+    # - comunicación IO-Link
+    # ------------------------------------------------------------
+    salida = re.search(
+        r"\b(?:salida|señal|senal|protocolo|comunicacion|comunicación)\s+"
+        r"([a-zA-Z0-9\-\s/\.]+)",
+        t_original,
+        re.IGNORECASE,
+    )
+
+    if salida:
+        valor = salida.group(1).strip()
+        valor = re.split(r"[,.;\n]| con | para | y ", valor, maxsplit=1)[0].strip()
+
+        if valor:
+            campos["salida"] = valor
+
+    # Si el cliente no escribió la palabra salida/señal, pero sí un patrón eléctrico claro.
+    salida_patron = re.search(
+        r"\b(\d+[\.,]?\d*)\s*-\s*(\d+[\.,]?\d*)\s*(ma|v)\b",
+        t,
+        re.IGNORECASE,
+    )
+
+    if salida_patron and "salida" not in campos:
+        inicio, fin, unidad = salida_patron.groups()
+        campos["salida"] = f"{inicio}-{fin} {unidad}"
+
+    # ------------------------------------------------------------
+    # 3. Conexión mecánica
+    # Ejemplos:
+    # - 1/2 NPT
+    # - 3/4 BSP
+    # - conexión roscada
+    # - conexión bridada
+    # ------------------------------------------------------------
+    conexion_medida = re.search(
+        r"\b(\d+/\d+|\d+\.\d+|\d+)\s*(?:\"|''|pulg|pulgada|pulgadas)?\s*"
+        r"([a-zA-Z]{2,10})\b",
+        t,
+        re.IGNORECASE,
+    )
+
+    if conexion_medida:
+        medida, tipo = conexion_medida.groups()
+
+        # Evitamos capturar cualquier unidad eléctrica como conexión.
+        if tipo.lower() not in {"v", "vac", "vdc", "ma", "a", "hz", "bar", "psi"}:
+            campos["conexion"] = f"{medida} {tipo}"
+
+    conexion_texto = re.search(
+        r"\bconexion\s+([a-zA-Z0-9\-\s/\.]+)",
+        t_original,
+        re.IGNORECASE,
+    )
+
+    if conexion_texto and "conexion" not in campos:
+        valor = conexion_texto.group(1).strip()
+        valor = re.split(r"[,.;\n]| con | para | y ", valor, maxsplit=1)[0].strip()
+
+        if valor:
+            campos["conexion"] = valor
+
+    # ------------------------------------------------------------
+    # 4. Material declarado explícitamente
+    # No usamos lista cerrada. Solo extraemos si el usuario lo declara.
+    # Ejemplos:
+    # - material acero inoxidable
+    # - cuerpo en bronce
+    # - fabricado en PVC
+    # ------------------------------------------------------------
+    material = re.search(
+        r"\b(?:material|cuerpo en|fabricado en|construido en|en material)\s+"
+        r"([a-zA-Z0-9áéíóúñÁÉÍÓÚÑ\-\s/\.]+)",
+        t_original,
+        re.IGNORECASE,
+    )
+
+    if material:
+        valor = material.group(1).strip()
+        valor = re.split(r"[,.;\n]| con | para | y ", valor, maxsplit=1)[0].strip()
+
+        if valor:
+            campos["material"] = valor
+
+    # ------------------------------------------------------------
+    # 5. Protección IP
+    # Ejemplos:
+    # - IP65
+    # - ip 67
+    # ------------------------------------------------------------
+    ip = re.search(r"\bip\s*(\d{2})\b", t, re.IGNORECASE)
+
+    if ip:
+        campos["proteccion"] = f"IP{ip.group(1)}"
+
+    # ------------------------------------------------------------
+    # 6. Voltaje / alimentación
+    # Ejemplos:
+    # - 24 VDC
+    # - 110 VAC
+    # - alimentación 220V
+    # ------------------------------------------------------------
+    voltaje = re.search(
+        r"\b(\d+[\.,]?\d*)\s*(v|vac|vdc)\b",
+        t,
+        re.IGNORECASE,
+    )
+
+    if voltaje:
+        valor, unidad = voltaje.groups()
+        campos["voltaje"] = f"{valor} {unidad.upper()}"
+
+    alimentacion = re.search(
+        r"\b(?:alimentacion|alimentación)\s+([a-zA-Z0-9\-\s/\.]+)",
+        t_original,
+        re.IGNORECASE,
+    )
+
+    if alimentacion and "voltaje" not in campos:
+        valor = alimentacion.group(1).strip()
+        valor = re.split(r"[,.;\n]| con | para | y ", valor, maxsplit=1)[0].strip()
+
+        if valor:
+            campos["voltaje"] = valor
+
+    return campos
+
 def _contiene_indicador_accesorio(texto: str) -> bool:
     """
     Detecta si un producto parece ser accesorio, control, repuesto,
@@ -526,19 +903,19 @@ def _penalizacion_por_incompatibilidad(prod: dict, query: str) -> float:
         return 0.65
 
     return 1.0
-def _score_producto(prod: dict, query: str) -> float:
+
+def _score_producto(
+    prod: dict,
+    query: str,
+    campos_query: Optional[dict] = None,
+) -> float:
     """
     Score compuesto para evaluar relevancia real.
 
-    Componentes:
-    - Cobertura de tokens en texto total: 45%
-    - Cobertura de tokens en nombre/categoría: 25%
-    - Similitud contra nombre: 15%
-    - Similitud contra descripción corta: 10%
-    - Score NIA previo: 5%
+    Mantiene el scoring estable actual basado en cobertura textual y agrega,
+    de forma opcional, scoring por campos técnicos estructurados.
 
-    Este enfoque es más robusto que SequenceMatcher puro porque el catálogo
-    tiene nombres y descripciones largas.
+    Si no hay campos_query, el comportamiento sigue siendo el mismo.
     """
     query_tokens = _tokens(query)
 
@@ -567,7 +944,7 @@ def _score_producto(prod: dict, query: str) -> float:
     except (TypeError, ValueError):
         score_nia_norm = 0.0
 
-    score = (
+    score_textual = (
         coverage_total * 0.45
         + coverage_nombre * 0.25
         + sim_nombre * 0.15
@@ -575,8 +952,20 @@ def _score_producto(prod: dict, query: str) -> float:
         + score_nia_norm * 0.05
     )
 
-    # Penalización leve si el producto no está visible en línea.
-    # No lo descartamos automáticamente porque puede ser producto interno cotizable.
+    score_campos = 0.0
+
+    if campos_query:
+        descripcion_larga = _clean_text(prod.get("descripcion_larga"))
+        campos_producto = _parsear_campos(descripcion_larga)
+        score_campos = _score_campos_estructurados(campos_producto, campos_query)
+
+    if campos_query and score_campos > 0:
+        # El texto sigue pesando más porque no todos los productos tienen
+        # descripción larga estructurada con separador ¦.
+        score = (score_textual * 0.70) + (score_campos * 0.30)
+    else:
+        score = score_textual
+
     if prod.get("visible_en_linea") is False:
         score *= 0.90
 
@@ -588,13 +977,15 @@ def evaluar_coincidencia(
     query: str,
     campos: int = 1,
     marca_presente: bool = False,
+    campos_query: Optional[dict] = None,
 ) -> Tuple[bool, Optional[dict]]:
     """
     Evalúa resultados y retorna UNO solo: el mejor producto confiable.
 
     Reglas:
     - Si no hay resultados, retorna False.
-    - Si hay más contexto técnico, se permite un umbral menor.
+    - Si hay más contexto técnico, permite un umbral menor.
+    - Si hay campos técnicos detectados, se usa scoring estructurado adicional.
     - No acepta productos sin nombre/categoría/descripción.
     """
     if not resultados:
@@ -607,14 +998,26 @@ def evaluar_coincidencia(
     else:
         umbral = UMBRAL_BASE
 
+    if campos_query:
+        cantidad_campos_query = len(campos_query)
+
+        if cantidad_campos_query >= 3:
+            umbral = min(umbral, 0.45)
+        elif cantidad_campos_query == 2:
+            umbral = min(umbral, 0.50)
+
     candidatos = []
 
     for producto in resultados:
-        # Evita candidatos imposibles de explicar al cliente.
         if not producto.get("nombre") and not producto.get("descripcion_corta"):
             continue
 
-        score = _score_producto(producto, query)
+        score = _score_producto(
+            producto,
+            query,
+            campos_query=campos_query,
+        )
+
         candidatos.append((score, producto))
 
     if not candidatos:
@@ -625,15 +1028,17 @@ def evaluar_coincidencia(
     mejor_score, mejor_prod = candidatos[0]
 
     logger.debug(
-        "Mejor score catálogo: %.3f | umbral: %.2f | codigo: %s | nombre: %s",
+        "Mejor score catálogo: %.3f | umbral: %.2f | codigo: %s | nombre: %s | campos_query: %s",
         mejor_score,
         umbral,
         mejor_prod.get("codigo"),
         mejor_prod.get("nombre"),
+        list(campos_query.keys()) if campos_query else [],
     )
 
     if mejor_score >= umbral:
         mejor_prod["_score"] = mejor_score
+        mejor_prod["_campos_match"] = list(campos_query.keys()) if campos_query else []
         return True, mejor_prod
 
     return False, None

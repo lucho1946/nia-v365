@@ -39,7 +39,9 @@ from nia_prompt import PROMPT_MAESTRO
 from catalog import (
     buscar_por_codigo,
     buscar_por_texto,
+    buscar_con_campos,
     evaluar_coincidencia,
+    formatear_producto,
 )
 from product_matcher import validar_compatibilidad_producto
 from file_processor import procesar_archivo
@@ -538,18 +540,25 @@ async def buscar_en_catalogo(texto: str) -> dict:
 
     resultados = None
     query_usada = None
+    campos_query = {}
 
     for query in queries_catalogo:
         logger.info("Intentando búsqueda catálogo con query limpia: '%s'", query)
 
-        resultados = await buscar_por_texto(query)
+        # Búsqueda híbrida:
+        # - Limpia lenguaje conversacional.
+        # - Extrae campos técnicos si existen.
+        # - Consulta MongoDB como fuente oficial.
+        # - NO decide compatibilidad final.
+        resultados, campos_query = await buscar_con_campos(query)
 
         if resultados:
             query_usada = query
             logger.info(
-                "Catálogo devolvió %s candidatos usando query='%s'",
+                "Catálogo devolvió %s candidatos usando query='%s' campos_query=%s",
                 len(resultados),
                 query,
+                campos_query,
             )
             break
 
@@ -562,9 +571,10 @@ async def buscar_en_catalogo(texto: str) -> dict:
         }
 
     ok_textual, prod_textual = evaluar_coincidencia(
-        resultados=resultados,
-        query=query_usada or texto,
-        campos=2,
+    resultados,
+    texto,
+    campos=len(campos_query) if campos_query else 1,
+    campos_query=campos_query,
     )
 
     if ok_textual and prod_textual:
@@ -581,6 +591,7 @@ async def buscar_en_catalogo(texto: str) -> dict:
         contexto_tecnico={
             "query_catalogo": query_usada,
             "queries_intentadas": queries_catalogo,
+            "campos_query": campos_query,
         },
     )
 
