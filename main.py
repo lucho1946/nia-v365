@@ -451,6 +451,184 @@ async def evaluar_necesidad(texto: str) -> dict:
         "dominio": dominio,
     }
 
+# ============================================================
+# MATCH TEXTUAL SEGURO SOBRE CANDIDATO DE CATÁLOGO
+# ============================================================
+
+PALABRAS_FUNCIONALES_MATCH = {
+    "necesito",
+    "necesitamos",
+    "quiero",
+    "requiero",
+    "requiere",
+    "busco",
+    "buscar",
+    "cotizar",
+    "cotizacion",
+    "cotización",
+    "producto",
+    "equipo",
+    "sistema",
+    "para",
+    "con",
+    "una",
+    "uno",
+    "unos",
+    "unas",
+    "del",
+    "de",
+    "la",
+    "el",
+    "los",
+    "las",
+    "que",
+    "por",
+    "favor",
+}
+
+
+def _normalizar_match_textual(valor: str) -> str:
+    """
+    Normaliza texto para comparar intención del cliente contra nombre/descr.
+    No decide compatibilidad técnica; solo ayuda a detectar coincidencias claras.
+    """
+    if not valor:
+        return ""
+
+    valor = str(valor).lower()
+    valor = re.sub(r"[^\w\sáéíóúñü-]", " ", valor, flags=re.IGNORECASE)
+    valor = re.sub(r"\s+", " ", valor).strip()
+
+    # Normalización simple de tildes sin depender de librerías externas.
+    reemplazos = {
+        "á": "a",
+        "é": "e",
+        "í": "i",
+        "ó": "o",
+        "ú": "u",
+        "ü": "u",
+        "ñ": "n",
+    }
+
+    for origen, destino in reemplazos.items():
+        valor = valor.replace(origen, destino)
+
+    return valor
+
+
+def _tokens_producto_cliente(texto: str) -> list[str]:
+    """
+    Extrae tokens útiles de una necesidad del cliente.
+
+    Importante:
+    - No es una lista de productos.
+    - Solo elimina palabras funcionales del lenguaje.
+    """
+    texto_norm = _normalizar_match_textual(texto)
+
+    return [
+        token
+        for token in texto_norm.split()
+        if len(token) > 2
+        and not token.isdigit()
+        and token not in PALABRAS_FUNCIONALES_MATCH
+    ]
+
+
+def _cobertura_tokens_en_texto(tokens: list[str], texto_objetivo: str) -> float:
+    """
+    Calcula cuántos tokens de la solicitud aparecen en el texto del producto.
+    """
+    if not tokens:
+        return 0.0
+
+    objetivo_norm = _normalizar_match_textual(texto_objetivo)
+    objetivo_tokens = set(objetivo_norm.split())
+
+    if not objetivo_tokens:
+        return 0.0
+
+    encontrados = 0
+
+    for token in tokens:
+        if token in objetivo_tokens:
+            encontrados += 1
+            continue
+
+        # Coincidencia flexible para singular/plural o variantes pequeñas.
+        if any(token in obj or obj in token for obj in objetivo_tokens if len(obj) > 3):
+            encontrados += 1
+
+    return encontrados / len(tokens)
+
+
+def _debe_promover_related_a_exacto(
+    texto_cliente: str,
+    producto: dict,
+    estado_match: str,
+    campos_query: Optional[dict] = None,
+) -> bool:
+    """
+    Promueve un related_match a exact_match solo cuando hay evidencia textual fuerte.
+
+    Regla segura:
+    - Solo aplica si el matcher ya encontró un producto relacionado.
+    - No aplica cuando hay campos técnicos detectados, porque allí conviene validar.
+    - Requiere mínimo 2 tokens útiles.
+    - Requiere alta cobertura en nombre o descripción corta.
+
+    Esto evita parches específicos como:
+    if "bomba centrifuga" in texto
+    """
+    if estado_match != "related_match":
+        return False
+
+    if not producto:
+        return False
+
+    # Si hay campos técnicos, preferimos mantener validación técnica.
+    # Ejemplo: rango, salida, conexión, voltaje, material.
+    if campos_query:
+        return False
+
+    tokens = _tokens_producto_cliente(texto_cliente)
+
+    if len(tokens) < 2:
+        return False
+
+    nombre = producto.get("nombre") or ""
+    descripcion_corta = producto.get("descripcion_corta") or ""
+    categoria = " ".join(
+        [
+            str(producto.get("categoria") or ""),
+            str(producto.get("nivel_3") or ""),
+            str(producto.get("nivel_4") or ""),
+        ]
+    )
+
+    cobertura_nombre = _cobertura_tokens_en_texto(tokens, nombre)
+    cobertura_desc = _cobertura_tokens_en_texto(tokens, descripcion_corta)
+    cobertura_categoria = _cobertura_tokens_en_texto(tokens, categoria)
+
+    logger.info(
+        "Evaluando promocion related->exact tokens=%s codigo=%s cobertura_nombre=%.2f cobertura_desc=%.2f cobertura_categoria=%.2f",
+        tokens,
+        producto.get("codigo"),
+        cobertura_nombre,
+        cobertura_desc,
+        cobertura_categoria,
+    )
+
+    # Caso fuerte:
+    # "bomba centrifuga" dentro de "Bomba centrifuga autocebante"
+    if cobertura_nombre >= 0.90:
+        return True
+
+    # Caso aceptable si nombre + descripción/categoría respaldan la misma intención.
+    if cobertura_nombre >= 0.75 and (cobertura_desc >= 0.75 or cobertura_categoria >= 0.75):
+        return True
+
+    return False
 
 # ─────────────────────────────────────────────────────────────
 # Búsqueda catálogo / compatibilidad
@@ -597,6 +775,33 @@ async def buscar_en_catalogo(texto: str) -> dict:
 
     estado_match = decision.get("estado")
     producto = decision.get("producto")
+
+    # ------------------------------------------------------------
+    # Promoción segura related_match -> exact_match
+    # ------------------------------------------------------------
+    # El product_matcher puede ser conservador y marcar como relacionado
+    # un producto que textualmente coincide muy bien con la necesidad.
+    #
+    # No bajamos umbrales globales.
+    # No quemamos productos.
+    # No aplica si hay campos técnicos, porque ahí sí conviene validar.
+    if _debe_promover_related_a_exacto(
+        texto_cliente=texto,
+        producto=producto,
+        estado_match=estado_match,
+        campos_query=campos_query,
+    ):
+        logger.info(
+            "Promoviendo related_match a exact_match por coincidencia textual fuerte codigo=%s",
+            producto.get("codigo") if producto else None,
+        )
+
+        estado_match = "exact_match"
+        decision["estado"] = "exact_match"
+        decision["razon"] = (
+            decision.get("razon")
+            or "El nombre del producto coincide claramente con la necesidad indicada."
+        )
 
     if estado_match == "exact_match" and producto:
         producto["_compatibilidad"] = {
