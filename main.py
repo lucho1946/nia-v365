@@ -33,7 +33,13 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from pydantic import BaseModel
 
-from memory import get_session, save_session, ensure_index
+from memory import (
+    get_session,
+    save_session,
+    ensure_index,
+    get_cliente,
+    upsert_cliente,
+)
 from openai_client import call_nia, call_llm_json
 from nia_prompt import PROMPT_MAESTRO
 from catalog import (
@@ -1291,6 +1297,79 @@ def _parece_empresa_simple(texto: str) -> Optional[str]:
 
     return limpio
 
+def _extraer_datos_contacto_desde_mensaje(mensaje: str) -> dict:
+
+    datos = {}
+    if not mensaje:
+        return datos
+
+    texto_original = str(mensaje).strip()
+
+    # ------------------------------------------------------------
+    # 1. Extraer email si existe
+    # ------------------------------------------------------------
+    match_email = re.search(
+        r"[\w\.-]+@[\w\.-]+\.\w+",
+        texto_original,
+        flags=re.IGNORECASE,
+    )
+
+    if match_email:
+        datos["email"] = match_email.group(0).strip().lower()
+
+    # ------------------------------------------------------------
+    # 2. Construir candidato de nombre quitando email y frases comunes
+    # ------------------------------------------------------------
+    texto_nombre = texto_original
+
+    if match_email:
+        texto_nombre = texto_nombre.replace(match_email.group(0), " ")
+
+    patrones_limpieza = [
+        r"\bmi\s+nombre\s+es\b",
+        r"\bnombre\s+es\b",
+        r"\bme\s+llamo\b",
+        r"\bsoy\b",
+        r"\bmi\s+correo\s+es\b",
+        r"\bcorreo\s+es\b",
+        r"\bcorreo\s+electr[oó]nico\s+es\b",
+        r"\bcorreo\s+electr[oó]nico\b",
+        r"\bcorreo\b",
+        r"\bemail\s+es\b",
+        r"\bemail\b",
+        r"\be-mail\s+es\b",
+        r"\be-mail\b",
+    ]
+
+    for patron in patrones_limpieza:
+        texto_nombre = re.sub(
+            patron,
+            " ",
+            texto_nombre,
+            flags=re.IGNORECASE,
+        )
+
+    # Quitar conectores sueltos que suelen quedar después de remover el correo.
+    texto_nombre = re.sub(
+        r"\b(y|con|para|al|a)\b",
+        " ",
+        texto_nombre,
+        flags=re.IGNORECASE,
+    )
+
+    # Limpiar puntuación y espacios.
+    texto_nombre = texto_nombre.strip(" ,.;:-")
+    texto_nombre = re.sub(r"\s+", " ", texto_nombre).strip()
+
+    # ------------------------------------------------------------
+    # 3. Validar si lo restante parece nombre
+    # ------------------------------------------------------------
+    nombre = _parece_nombre_simple(texto_nombre)
+
+    if nombre:
+        datos["nombre"] = nombre
+
+    return datos
 
 def _capturar_dato_comercial_por_etapa(mensaje: str, cliente: dict, etapa: str) -> dict:
     """
@@ -1298,12 +1377,27 @@ def _capturar_dato_comercial_por_etapa(mensaje: str, cliente: dict, etapa: str) 
 
     Esta función evita que datos como nombre, empresa o NIT sean tratados
     como búsqueda de producto cuando NIA está cerrando una cotización.
+
+    Regla Cotización IV:
+    Si NIA pide nombre y correo en un mismo turno, el backend debe poder
+    capturar ambos datos correctamente desde una respuesta natural.
     """
     cliente = dict(cliente or {})
+    mensaje = (mensaje or "").strip()
 
-    # extraer_datos_cliente ya capturó email/NIT si venían explícitos.
-    # Aquí completamos casos escritos de forma directa.
     if etapa in {"cotizacion", "calificacion", "confirmando_cierre"}:
+        datos_contacto = _extraer_datos_contacto_desde_mensaje(mensaje)
+
+        if not cliente.get("email") and datos_contacto.get("email"):
+            cliente["email"] = datos_contacto["email"]
+            logger.debug("Email capturado por parser de contacto: %s", cliente["email"])
+
+        if not cliente.get("nombre") and datos_contacto.get("nombre"):
+            cliente["nombre"] = datos_contacto["nombre"]
+            logger.debug("Nombre capturado por parser de contacto: %s", cliente["nombre"])
+
+        # Fallback para el caso simple:
+
         if not cliente.get("nombre"):
             nombre = _parece_nombre_simple(mensaje)
             if nombre:
@@ -1318,7 +1412,6 @@ def _capturar_dato_comercial_por_etapa(mensaje: str, cliente: dict, etapa: str) 
                 logger.debug("Empresa simple capturada por etapa: %s", empresa)
 
     return cliente
-
 
 def _respuesta_siguiente_dato_comercial(
     cliente: dict,
@@ -1426,6 +1519,45 @@ ESTADOS_COMERCIALES = {
     "cotizacion_lista",
 }
 
+def _ultimo_turno_pide_datos_contacto(historial: list) -> bool:
+    """
+    Detecta si el último mensaje de NIA pidió datos básicos de contacto.
+
+    Regla de negocio:
+    Si NIA acaba de pedir nombre/correo, el siguiente mensaje del cliente
+    debe ser tratado como dato comercial de cotización, no como búsqueda
+    de catálogo.
+
+    Esto protege el flujo cuando la etapa persistida queda inconsistente.
+    """
+    if not historial:
+        return False
+
+    # Buscar el último mensaje del asistente.
+    ultimo_assistant = None
+
+    for turno in reversed(historial):
+        if turno.get("role") == "assistant":
+            ultimo_assistant = turno.get("content", "")
+            break
+
+    if not ultimo_assistant:
+        return False
+
+    texto = _normalizar_intencion(ultimo_assistant)
+
+    indicadores_contacto = [
+        "nombre y correo",
+        "nombre y correo electronico",
+        "nombre y e mail",
+        "a nombre de quien",
+        "correo electronico",
+        "correo para enviar la cotizacion",
+        "dejar la solicitud lista",
+        "datos basicos",
+    ]
+
+    return any(indicador in texto for indicador in indicadores_contacto)
 
 def _manejar_estado_comercial_prioritario(
     etapa: str,
@@ -1585,7 +1717,36 @@ def _manejar_estado_comercial_prioritario(
 
     return None
 
+async def _persistir_cliente_permanente(
+    phone_id: Optional[str],
+    cliente: Optional[dict],
+) -> None:
+    """
+    Guarda datos comerciales del cliente en memoria permanente.
 
+    Esta memoria NO reemplaza la sesión conversacional.
+    Solo persiste datos reutilizables del cliente:
+    - nombre
+    - email
+    - empresa
+    - nit
+    - rut
+    - teléfono/phone_id
+
+    Si Mongo falla, no rompemos la conversación del cliente.
+    """
+    if not phone_id or not cliente:
+        return
+
+    try:
+        await upsert_cliente(phone_id, cliente)
+    except Exception as e:
+        logger.warning(
+            "No fue posible persistir cliente permanente phone_id=%s error=%s",
+            phone_id,
+            e,
+        )
+        
 async def _guardar_y_responder_turno(
     session_id: str,
     phone_id: Optional[str],
@@ -1598,7 +1759,11 @@ async def _guardar_y_responder_turno(
     necesidad_ctx: Optional[dict] = None,
     archivo_activo: Optional[dict] = None,
     items_resultado: Optional[list] = None,
-) -> dict:
+    cotizacion_recibida: bool = False,
+    archivo_cotizacion: Optional[str] = None,
+    proforma_recibida: bool = False,
+    archivo_proforma: Optional[str] = None,
+):
     """
     Guarda sesión y retorna respuesta final sin pasar por LLM.
 
@@ -1616,6 +1781,8 @@ async def _guardar_y_responder_turno(
         "ts": datetime.utcnow().isoformat(),
     }
 
+    await _persistir_cliente_permanente(phone_id, cliente)
+    
     await save_session(
         session_id=session_id,
         phone_id=phone_id,
@@ -1625,6 +1792,10 @@ async def _guardar_y_responder_turno(
         necesidad_ctx=necesidad_ctx or {},
         cliente=cliente or {},
         productos_acumulados=productos_acumulados or [],
+        cotizacion_recibida=cotizacion_recibida,
+        archivo_cotizacion=archivo_cotizacion,
+        proforma_recibida=proforma_recibida,
+        archivo_proforma=archivo_proforma,
     )
 
     return {
@@ -1655,10 +1826,53 @@ async def procesar_turno(
 
     historial = session.get("turnos", [])
     etapa = session.get("etapa", "inicio")
+        # ------------------------------------------------------------
+    # Guardrail de estado comercial:
+    # Si el último mensaje de NIA pidió datos de contacto, el
+    # siguiente mensaje del cliente debe procesarse como cotización,
+    # aunque la etapa guardada haya quedado inconsistente.
+    # ------------------------------------------------------------
+    if etapa in {"inicio", "descubrimiento"} and _ultimo_turno_pide_datos_contacto(historial):
+            logger.info(
+                "Corrigiendo etapa por último turno de contacto: session=%s etapa=%s -> cotizacion",
+                session_id,
+                etapa,
+            )
+            etapa = "cotizacion"
     archivo_activo = session.get("archivo_activo")
     necesidad_ctx = session.get("necesidad_ctx", {})
-    cliente = session.get("cliente", {})
+
+    # ------------------------------------------------------------
+    # Cliente: sesión temporal + memoria permanente
+    # ------------------------------------------------------------
+    # La sesión tiene prioridad porque contiene lo más reciente
+    # dentro de la conversación actual.
+    cliente_sesion = session.get("cliente", {}) or {}
+
+    cliente_permanente = {}
+
+    if phone_id:
+        try:
+            cliente_permanente = await get_cliente(phone_id) or {}
+        except Exception as e:
+            logger.warning(
+                "No fue posible cargar cliente permanente phone_id=%s error=%s",
+                phone_id,
+                e,
+            )
+            cliente_permanente = {}
+
+    cliente = {
+        **cliente_permanente,
+        **cliente_sesion,
+    }
+
     productos_acumulados = session.get("productos_acumulados", [])
+
+    cotizacion_recibida = bool(session.get("cotizacion_recibida", False))
+    archivo_cotizacion = session.get("archivo_cotizacion")
+    proforma_recibida = bool(session.get("proforma_recibida", False))
+    archivo_proforma = session.get("archivo_proforma")
 
     contexto_extra = ""
     nueva_etapa = etapa
@@ -1701,6 +1915,10 @@ async def procesar_turno(
                 necesidad_ctx=comercial.get("necesidad_ctx", {}),
                 archivo_activo=archivo_activo,
                 items_resultado=None,
+                cotizacion_recibida=cotizacion_recibida,
+                archivo_cotizacion=archivo_cotizacion,
+                proforma_recibida=proforma_recibida,
+                archivo_proforma=archivo_proforma,
             )
 
     # ══════════════════════════════════════════════════════
@@ -2067,17 +2285,24 @@ async def procesar_turno(
         "content": respuesta,
         "ts": datetime.utcnow().isoformat(),
     }
+    
+    await _persistir_cliente_permanente(phone_id, cliente)
 
     await save_session(
         session_id=session_id,
         phone_id=phone_id,
         turnos=historial + [turno_user, turno_nia],
-        etapa=nueva_etapa,
+        etapa=etapa,
         archivo_activo=archivo_activo,
-        necesidad_ctx=necesidad_ctx,
-        cliente=cliente,
-        productos_acumulados=productos_acumulados,
+        necesidad_ctx=necesidad_ctx or {},
+        cliente=cliente or {},
+        productos_acumulados=productos_acumulados or [],
+        cotizacion_recibida=cotizacion_recibida,
+        archivo_cotizacion=archivo_cotizacion,
+        proforma_recibida=proforma_recibida,
+        archivo_proforma=archivo_proforma,
     )
+    
 
     return {
         "respuesta": respuesta,
