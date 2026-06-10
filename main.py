@@ -319,7 +319,9 @@ def datos_faltantes(cliente: dict, etapa: str) -> list:
         if not cliente.get("empresa"):
             faltantes.append("¿Cuál es la razón social de tu empresa?")
         if not cliente.get("nit"):
-            faltantes.append("¿Cuál es el NIT?")
+            faltantes.append("¿Cuál es el NIT de la empresa?")
+        if not cliente.get("rut"):
+            faltantes.append("¿Puedes compartir el RUT?")
 
     return faltantes
 
@@ -1318,39 +1320,79 @@ def _capturar_dato_comercial_por_etapa(mensaje: str, cliente: dict, etapa: str) 
     return cliente
 
 
-def _respuesta_siguiente_dato_comercial(cliente: dict) -> tuple[str, str]:
+def _respuesta_siguiente_dato_comercial(
+    cliente: dict,
+    etapa_objetivo: str = "cotizacion",
+) -> tuple[str, str]:
     """
-    Decide cuál es el siguiente dato comercial faltante.
+    Decide el siguiente dato comercial que NIA debe pedir.
 
-    Orden profesional:
-    1. Nombre
-    2. Email
-    3. Razón social
-    4. NIT
-    5. Cierre listo para revisión de asesor
+    Regla comercial actualizada:
+    - Para cotización SOLO se pide nombre y correo.
+    - Después del correo, NIA deja la solicitud lista para asesor/vendedor.
+    - NIA NO pide razón social, NIT ni RUT en cotización.
+    - Razón social, NIT y RUT solo se piden si la etapa objetivo es proforma.
+
+    Esto implementa la barrera solicitada:
+    cotización enviada/aprobada primero, proforma después.
     """
-    cliente = cliente or {}
-    nombre = cliente.get("nombre")
 
-    if not cliente.get("nombre"):
-        return "¿A nombre de quién va la cotización?", "cotizacion"
+    nombre = (cliente.get("nombre") or "").strip()
 
-    if not cliente.get("email"):
-        return f"Gracias, {nombre}. ¿Cuál es el correo electrónico para enviar la cotización?", "cotizacion"
+    # ============================================================
+    # ETAPA COTIZACIÓN
+    # ============================================================
+    if etapa_objetivo in {"cotizacion", "calificacion", "confirmando_cierre"}:
+        if not cliente.get("nombre"):
+            return "¿A nombre de quién va la cotización?", "cotizacion"
 
-    if not cliente.get("empresa"):
+        if not cliente.get("email"):
+            return (
+                f"Gracias, {nombre}. ¿Cuál es el correo electrónico para enviar la cotización?",
+                "cotizacion",
+            )
+
+        # Punto final de la etapa de cotización.
+        # No pedimos empresa, NIT ni RUT aquí.
         return (
-            f"Perfecto, {nombre}. Para preparar la proforma, ¿cuál es la razón social de tu empresa?",
+            (
+                f"Perfecto, {nombre}. Ya dejé la solicitud lista para que un asesor "
+                "revise disponibilidad, precio y condiciones antes de enviar la cotización."
+            ),
+            "cotizacion_lista",
+        )
+
+    # ============================================================
+    # ETAPA PROFORMA
+    # ============================================================
+    # Esta etapa solo debe activarse cuando exista una señal futura:
+    # - vendedor confirmó que envió la cotización;
+    # - cliente confirmó que cumple técnicamente.
+    #==============================================================
+    
+    if etapa_objetivo == "proforma":
+        if not cliente.get("empresa"):
+            return (
+                f"Perfecto, {nombre or 'cliente'}. Para preparar la proforma, "
+                "¿cuál es la razón social de tu empresa?",
+                "proforma",
+            )
+
+        if not cliente.get("nit"):
+            return "Gracias. ¿Cuál es el NIT de la empresa?", "proforma"
+
+        if not cliente.get("rut"):
+            return "Gracias. Para continuar con la proforma, ¿puedes compartir el RUT?", "proforma"
+
+        return (
+            "Perfecto, ya tengo los datos necesarios para la proforma. Un asesor continuará con el proceso.",
             "proforma",
         )
 
-    if not cliente.get("nit"):
-        return "Gracias. ¿Cuál es el NIT de la empresa?", "proforma"
-
+    # Fallback seguro: si llega una etapa desconocida, no avanzar a proforma.
     return (
-    "Perfecto, ya tengo el producto, la cantidad y los datos básicos.\n\n"
-    "Voy a dejar la solicitud lista para que un asesor revise disponibilidad, precio y condiciones antes de continuar con la cotización.",
-    "cotizacion_lista",
+        "Perfecto, ya dejé la solicitud lista para que un asesor revise disponibilidad, precio y condiciones.",
+        "cotizacion_lista",
     )
 
 
@@ -1485,7 +1527,10 @@ def _manejar_estado_comercial_prioritario(
             etapa=etapa,
         )
 
-        respuesta_dato, etapa_dato = _respuesta_siguiente_dato_comercial(cliente)
+        respuesta_dato, etapa_dato = _respuesta_siguiente_dato_comercial(
+            cliente,
+            etapa_objetivo="cotizacion",
+        )
 
         return {
             "handled": True,
@@ -1507,7 +1552,12 @@ def _manejar_estado_comercial_prioritario(
             etapa=etapa,
         )
 
-        respuesta_dato, etapa_dato = _respuesta_siguiente_dato_comercial(cliente)
+        etapa_objetivo = "proforma" if etapa == "proforma" else "cotizacion"
+
+        respuesta_dato, etapa_dato = _respuesta_siguiente_dato_comercial(
+            cliente,
+            etapa_objetivo=etapa_objetivo,
+        )
 
         return {
             "handled": True,
