@@ -243,6 +243,49 @@ Responde SOLO JSON válido, sin markdown:
   "razon": "frase corta"
 }
 """
+RESPUESTAS_CORTAS_COMERCIALES = {
+    "sí",
+    "si",
+    "no",
+    "ok",
+    "dale",
+    "listo",
+    "perfecto",
+    "correcto",
+    "claro",
+    "bueno",
+    "exacto",
+    "así es",
+    "asi es",
+    "de acuerdo",
+    "negativo",
+    "está bien",
+    "esta bien",
+    "okay",
+    "okey",
+    "va",
+    "por supuesto",
+    "con gusto",
+    "adelante",
+    "procede",
+    "proceder",
+    "confirmado",
+    "confirmo",
+    "entendido",
+    "recibido",
+    "enterado",
+    "solo esto",
+    "solo eso",
+    "con esto",
+    "con eso",
+    "eso es todo",
+    "nada mas",
+    "nada más",
+    "es todo",
+    "eso es",
+    "solo",
+    "eso",
+}
 
 async def clasificar_mensaje(mensaje: str, etapa: str) -> dict:
     """
@@ -312,20 +355,7 @@ async def clasificar_mensaje(mensaje: str, etapa: str) -> dict:
             "razon": "cantidad numérica",
         }
 
-    if msg_lower in {
-        "si",
-        "sí",
-        "no",
-        "ok",
-        "dale",
-        "listo",
-        "perfecto",
-        "correcto",
-        "claro",
-        "bueno",
-        "exacto",
-        "de acuerdo",
-    }:
+    if msg_lower.strip() in RESPUESTAS_CORTAS_COMERCIALES:
         return {
             "tipo": "instruccion_comercial",
             "confianza": 1.0,
@@ -529,8 +559,6 @@ def datos_faltantes(cliente: dict, etapa: str) -> list:
             faltantes.append("¿Cuál es la razón social de tu empresa?")
         if not cliente.get("nit"):
             faltantes.append("¿Cuál es el NIT de la empresa?")
-        if not cliente.get("rut"):
-            faltantes.append("¿Puedes compartir el RUT?")
 
     return faltantes
 
@@ -1693,10 +1721,7 @@ def _respuesta_siguiente_dato_comercial(
         # Punto final de la etapa de cotización.
         # No pedimos empresa, NIT ni RUT aquí.
         return (
-            (
-                f"Perfecto, {nombre}. Ya dejé la solicitud lista para que un asesor "
-                "revise disponibilidad, precio y condiciones antes de enviar la cotización."
-            ),
+            f"Perfecto, {nombre}, ya quedé con tu solicitud. En breve recibirás la cotización en tu correo.",
             "cotizacion_lista",
         )
 
@@ -1732,8 +1757,7 @@ def _respuesta_siguiente_dato_comercial(
             cliente["rut"] = "pendiente"
 
         return (
-            "Perfecto, ya tengo razón social y NIT. "
-            "Dejo la proforma lista para revisión del asesor; si requiere el RUT, te lo solicitará.",
+            f"Perfecto, {nombre or 'cliente'}, ya tengo todos los datos. En breve recibirás la proforma.",
             "proforma_lista",
         )
 
@@ -2008,9 +2032,8 @@ def _manejar_estado_comercial_prioritario(
             return {
                 "handled": True,
                 "respuesta": (
-                    "Gracias, recibí el RUT y lo dejo asociado a la solicitud. "
-                    "La proforma queda lista para revisión del asesor. "
-                    "Cuando recibas la proforma, me confirmas si deseas proceder con el pago."
+                        "Gracias, recibí el RUT y lo dejé asociado a tu solicitud. "
+                        "En breve recibirás la proforma."
                 ),
                 "etapa": "proforma_lista",
                 "cliente": cliente,
@@ -2021,8 +2044,7 @@ def _manejar_estado_comercial_prioritario(
         return {
             "handled": True,
             "respuesta": (
-                "La proforma ya quedó lista para revisión del asesor. "
-                "Cuando recibas la proforma, me confirmas si deseas proceder con el pago."
+                "Tu proforma está en proceso. Cuando la recibas, me confirmas si deseas proceder con el pago."
             ),
             "etapa": "proforma_lista",
             "cliente": cliente,
@@ -2149,9 +2171,7 @@ def _manejar_estado_comercial_prioritario(
         return {
             "handled": True,
             "respuesta": (
-                "Perfecto, ya tengo el producto, la cantidad y los datos básicos.\n\n"
-                "Voy a dejar la solicitud lista para que un asesor revise disponibilidad, "
-                "precio y condiciones antes de continuar con la cotización."
+                "Tu cotización está en proceso. Cuando la recibas, me confirmas si cumple con lo que necesitas técnicamente."
             ),
             "etapa": "cotizacion_lista",
             "cliente": cliente,
@@ -2717,12 +2737,20 @@ async def procesar_turno(
     msg_llm = mensaje if mensaje.strip() else f"[Cliente envió archivo: {archivo_nombre}]"
 
     respuesta_segura = _extraer_respuesta_segura(contexto_extra)
-    
+
     if nueva_etapa == "cotizacion_lista" and not respuesta_segura:
-        respuesta_segura = (
-            "Perfecto, ya tengo el producto, la cantidad y los datos básicos.\n\n"
-            "Voy a dejar la solicitud lista para que un asesor revise disponibilidad, precio y condiciones antes de continuar con la cotización."
-        )
+        nombre_cliente = (cliente.get("nombre") or "").strip()
+
+        if nombre_cliente:
+            respuesta_segura = (
+                f"Perfecto, {nombre_cliente}, ya quedé con tu solicitud. "
+                "En breve recibirás la cotización en tu correo."
+            )
+        else:
+            respuesta_segura = (
+                "Perfecto, ya quedé con tu solicitud. "
+                "En breve recibirás la cotización en tu correo."
+            )
 
     if respuesta_segura:
         respuesta = respuesta_segura
