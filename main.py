@@ -195,6 +195,209 @@ REF_RE = re.compile(r"\b(P\d{3,}|[A-Z]{1,4}\d{3,}[A-Z0-9]*)\b", re.IGNORECASE)
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 NIT_RE = re.compile(r"\b(\d{8,10}-?\d?)\b")
 
+# ============================================================
+# CLASIFICADOR DE INTENCIÓN — COTIZACIÓN V
+# ============================================================
+
+TIPOS_MENSAJE_VALIDOS = {
+    "buscar_producto",
+    "instruccion_comercial",
+    "dato_personal",
+    "pregunta_estado",
+    "cotizacion_recibida",
+    "proforma_recibida",
+    "link_documento",
+    "saludo",
+    "otro",
+}
+
+PROMPT_CLASIFICADOR_MENSAJE = """
+Eres el clasificador de intención de NIA, asistente comercial técnico de ViaIndustrial.
+
+Tu tarea es clasificar el mensaje del cliente en UNA sola categoría.
+
+Categorías válidas:
+
+1. "buscar_producto"
+El cliente describe un producto, da código, referencia, marca, aplicación o características técnicas.
+2. "instruccion_comercial"
+El cliente responde al flujo comercial: confirma, niega, da cantidad, dice que cotizamos, pide continuar o cerrar.
+3. "dato_personal"
+El cliente entrega datos personales o comerciales: nombre, correo, empresa, NIT, RUT, teléfono.
+4. "pregunta_estado"
+El cliente pregunta por el estado de pedido, cotización, entrega, despacho o disponibilidad.
+5. "cotizacion_recibida"
+El cliente indica que ya recibió o ya tiene la cotización.
+6. "proforma_recibida"
+El cliente indica que ya recibió o ya tiene la proforma.
+7. "link_documento"
+El cliente envía un link que puede corresponder a cotización, proforma, archivo o documento.
+8. "saludo"
+El cliente solo saluda.
+9. "otro"
+No encaja claramente en las anteriores.
+Responde SOLO JSON válido, sin markdown:
+{
+  "tipo": "categoria",
+  "confianza": 0.0,
+  "razon": "frase corta"
+}
+"""
+
+async def clasificar_mensaje(mensaje: str, etapa: str) -> dict:
+    """
+    Clasifica el mensaje del cliente usando reglas rápidas + GPT.
+
+    Diseño:
+    - Primero usa reglas determinísticas para casos obvios.
+    - Usa GPT solo cuando el mensaje es ambiguo.
+    - Nunca deja que GPT salte guardrails comerciales.
+    """
+    texto = (mensaje or "").strip()
+    msg_lower = texto.lower()
+
+    if not texto:
+        return {
+            "tipo": "otro",
+            "confianza": 0.0,
+            "razon": "mensaje vacío",
+        }
+
+    # ------------------------------------------------------------
+    # 1. Reglas rápidas sin GPT
+    # ------------------------------------------------------------
+
+    if re.search(r"https?://|drive\.google|dropbox|onedrive", msg_lower, re.IGNORECASE):
+        return {
+            "tipo": "link_documento",
+            "confianza": 1.0,
+            "razon": "contiene link de documento",
+        }
+
+    if any(frase in msg_lower for frase in [
+        "ya tengo la cotizacion",
+        "ya tengo la cotización",
+        "me llego la cotizacion",
+        "me llegó la cotización",
+        "ya recibi la cotizacion",
+        "ya recibí la cotización",
+        "ya me cotizaron",
+        "me enviaron la cotizacion",
+        "me enviaron la cotización",
+    ]):
+        return {
+            "tipo": "cotizacion_recibida",
+            "confianza": 1.0,
+            "razon": "cliente indica cotización recibida",
+        }
+
+    if any(frase in msg_lower for frase in [
+        "ya tengo la proforma",
+        "me llego la proforma",
+        "me llegó la proforma",
+        "ya recibi la proforma",
+        "ya recibí la proforma",
+        "me enviaron la proforma",
+    ]):
+        return {
+            "tipo": "proforma_recibida",
+            "confianza": 1.0,
+            "razon": "cliente indica proforma recibida",
+        }
+
+    if re.fullmatch(r"\d{1,5}", msg_lower):
+        return {
+            "tipo": "instruccion_comercial",
+            "confianza": 1.0,
+            "razon": "cantidad numérica",
+        }
+
+    if msg_lower in {
+        "si",
+        "sí",
+        "no",
+        "ok",
+        "dale",
+        "listo",
+        "perfecto",
+        "correcto",
+        "claro",
+        "bueno",
+        "exacto",
+        "de acuerdo",
+    }:
+        return {
+            "tipo": "instruccion_comercial",
+            "confianza": 1.0,
+            "razon": "respuesta corta de flujo",
+        }
+
+    if any(frase in msg_lower for frase in [
+        "solo eso",
+        "con eso",
+        "es todo",
+        "nada mas",
+        "nada más",
+        "cotiza",
+        "coticemos",
+    ]):
+        return {
+            "tipo": "instruccion_comercial",
+            "confianza": 1.0,
+            "razon": "cierre de cotización",
+        }
+
+    if re.search(r"[\w\.-]+@[\w\.-]+\.\w+", texto):
+        return {
+            "tipo": "dato_personal",
+            "confianza": 1.0,
+            "razon": "contiene correo electrónico",
+        }
+
+    if msg_lower in {"hola", "buenas", "buenos dias", "buenos días", "buen dia", "buen día"}:
+        return {
+            "tipo": "saludo",
+            "confianza": 1.0,
+            "razon": "saludo simple",
+        }
+
+    # ------------------------------------------------------------
+    # 2. Clasificación GPT para casos ambiguos
+    # ------------------------------------------------------------
+    prompt = f"""{PROMPT_CLASIFICADOR_MENSAJE}
+
+Etapa actual de la conversación: {etapa}
+Mensaje del cliente: "{texto}"
+
+Clasifica el mensaje.
+"""
+
+    try:
+        resultado = await call_llm_json(prompt)
+
+        tipo = str(resultado.get("tipo", "otro")).strip()
+        confianza = float(resultado.get("confianza", 0.0) or 0.0)
+        razon = str(resultado.get("razon", "")).strip()
+
+        if tipo not in TIPOS_MENSAJE_VALIDOS:
+            tipo = "otro"
+            confianza = 0.0
+            razon = "tipo inválido devuelto por clasificador"
+
+        return {
+            "tipo": tipo,
+            "confianza": confianza,
+            "razon": razon,
+        }
+
+    except Exception as e:
+        logger.warning("clasificar_mensaje falló: %s", e)
+        return {
+            "tipo": "otro",
+            "confianza": 0.0,
+            "razon": "fallback por error del clasificador",
+        }
+        
 PALABRAS_SALUDO = {"hola", "buenas", "buenos", "buen", "hi", "hello", "hey", "saludos"}
 PALABRAS_MAS = {"también", "otro", "otra", "más", "adicional", "y además", "necesito más", "y también"}
 PALABRAS_FIN = {"solo eso", "con eso", "es todo", "nada más", "eso es todo", "listo", "ok cotiza", "cotiza"}
@@ -1371,6 +1574,43 @@ def _extraer_datos_contacto_desde_mensaje(mensaje: str) -> dict:
 
     return datos
 
+def _extraer_rut_desde_mensaje(mensaje: str) -> Optional[str]:
+    """
+    Detecta si el cliente está compartiendo el RUT.
+
+    El RUT es documento/soporte tributario, no debe bloquear el flujo.
+    Si viene número, lo guardamos. Si solo dice que lo comparte, guardamos 'recibido'.
+    """
+    texto = (mensaje or "").strip()
+    if not texto:
+        return None
+
+    texto_norm = _normalizar_intencion(texto)
+
+    if "rut" not in texto_norm:
+        return None
+
+    nit_match = NIT_RE.search(texto)
+    if nit_match:
+        return nit_match.group(1).strip()
+
+    if any(
+        frase in texto_norm
+        for frase in {
+            "rut",
+            "te comparto el rut",
+            "envio el rut",
+            "envie el rut",
+            "adjunto el rut",
+            "rut adjunto",
+            "ya comparti el rut",
+            "ya envie el rut",
+        }
+    ):
+        return "recibido"
+
+    return None
+
 def _capturar_dato_comercial_por_etapa(mensaje: str, cliente: dict, etapa: str) -> dict:
     """
     Completa datos comerciales según el estado actual de la conversación.
@@ -1404,12 +1644,17 @@ def _capturar_dato_comercial_por_etapa(mensaje: str, cliente: dict, etapa: str) 
                 cliente["nombre"] = nombre
                 logger.debug("Nombre simple capturado por etapa: %s", nombre)
 
-    if etapa == "proforma":
+    if etapa in {"proforma", "proforma_lista"}:
         if not cliente.get("empresa"):
             empresa = _parece_empresa_simple(mensaje)
             if empresa:
                 cliente["empresa"] = empresa
                 logger.debug("Empresa simple capturada por etapa: %s", empresa)
+
+        rut = _extraer_rut_desde_mensaje(mensaje)
+        if rut and cliente.get("rut") in {None, "", "pendiente"}:
+            cliente["rut"] = rut
+            logger.debug("RUT capturado/actualizado por parser de RUT: %s", rut)
 
     return cliente
 
@@ -1474,13 +1719,24 @@ def _respuesta_siguiente_dato_comercial(
         if not cliente.get("nit"):
             return "Gracias. ¿Cuál es el NIT de la empresa?", "proforma"
 
+        # ------------------------------------------------------------
+        # RUT NO BLOQUEANTE
+        # ------------------------------------------------------------
+        # Regla de negocio:
+        # - NIT identifica tributariamente al cliente.
+        # - RUT es soporte/documento tributario.
+        # - Para no frenar el flujo comercial, si ya tenemos empresa
+        #   y NIT, dejamos la proforma lista para revisión del asesor.
+        # - Si el cliente ya compartió RUT, se conserva en cliente["rut"].
         if not cliente.get("rut"):
-            return "Gracias. Para continuar con la proforma, ¿puedes compartir el RUT?", "proforma"
+            cliente["rut"] = "pendiente"
 
         return (
-            "Perfecto, ya tengo los datos necesarios para la proforma. Un asesor continuará con el proceso.",
-            "proforma",
+            "Perfecto, ya tengo razón social y NIT. "
+            "Dejo la proforma lista para revisión del asesor; si requiere el RUT, te lo solicitará.",
+            "proforma_lista",
         )
+
 
     # Fallback seguro: si llega una etapa desconocida, no avanzar a proforma.
     return (
@@ -1515,8 +1771,12 @@ ESTADOS_COMERCIALES = {
     "confirmando_cierre",
     "cotizacion",
     "calificacion",
-    "proforma",
     "cotizacion_lista",
+    "cotizacion_enviada",
+    "proforma",
+    "proforma_lista",
+    "proforma_enviada",
+    "pago",
 }
 
 def _ultimo_turno_pide_datos_contacto(historial: list) -> bool:
@@ -1565,6 +1825,7 @@ def _manejar_estado_comercial_prioritario(
     cliente: dict,
     productos_acumulados: list,
     necesidad_ctx: dict,
+    clasificacion: Optional[dict] = None,
 ) -> Optional[dict]:
     """
     Controla estados comerciales de forma determinística.
@@ -1584,10 +1845,193 @@ def _manejar_estado_comercial_prioritario(
     cliente = dict(cliente or {})
     necesidad_ctx = dict(necesidad_ctx or {})
     productos_acumulados = productos_acumulados or []
+    
+    clasificacion = clasificacion or {}
+    tipo_mensaje = clasificacion.get("tipo")
 
     if not mensaje or etapa not in ESTADOS_COMERCIALES:
         return None
 
+    # ============================================================
+    # Cotización recibida por el cliente
+    # ============================================================
+    if tipo_mensaje in {"cotizacion_recibida", "link_documento"} and etapa in {
+        "cotizacion_lista",
+        "cotizacion",
+        "confirmando_cierre",
+    }:
+        necesidad_ctx["cotizacion_recibida"] = True
+
+        if tipo_mensaje == "link_documento":
+            necesidad_ctx["archivo_cotizacion"] = mensaje
+
+        return {
+            "handled": True,
+            "respuesta": (
+                "Perfecto, tomo esto como cotización recibida. "
+                "¿La cotización cumple con lo que necesitas técnicamente?"
+            ),
+            "etapa": "cotizacion_enviada",
+            "cliente": cliente,
+            "necesidad_ctx": necesidad_ctx,
+            "productos_acumulados": productos_acumulados,
+        }
+
+    # ============================================================
+    # Cliente valida cotización enviada
+    # ============================================================
+    if etapa == "cotizacion_enviada":
+        if _es_confirmacion_afirmativa(mensaje):
+            necesidad_ctx["cotizacion_aprobada_cliente"] = True
+
+            respuesta_dato, etapa_dato = _respuesta_siguiente_dato_comercial(
+                cliente,
+                etapa_objetivo="proforma",
+            )
+
+            return {
+                "handled": True,
+                "respuesta": respuesta_dato,
+                "etapa": etapa_dato,
+                "cliente": cliente,
+                "necesidad_ctx": necesidad_ctx,
+                "productos_acumulados": productos_acumulados,
+            }
+
+        if _es_confirmacion_negativa(mensaje):
+            necesidad_ctx["cotizacion_aprobada_cliente"] = False
+
+            return {
+                "handled": True,
+                "respuesta": (
+                    "Entiendo. Cuéntame qué ajuste necesitas en la cotización "
+                    "o qué característica técnica no cumple."
+                ),
+                "etapa": "descubrimiento",
+                "cliente": cliente,
+                "necesidad_ctx": necesidad_ctx,
+                "productos_acumulados": productos_acumulados,
+            }
+
+        return {
+            "handled": True,
+            "respuesta": (
+                "Para avanzar correctamente, necesito confirmar: "
+                "¿la cotización cumple con lo que necesitas técnicamente?"
+            ),
+            "etapa": "cotizacion_enviada",
+            "cliente": cliente,
+            "necesidad_ctx": necesidad_ctx,
+            "productos_acumulados": productos_acumulados,
+        }
+
+    # ============================================================
+    # Proforma recibida por el cliente
+    # ============================================================
+    if tipo_mensaje in {"proforma_recibida", "link_documento"} and etapa in {
+        "proforma",
+        "proforma_lista",
+        "cotizacion_enviada",
+    }:
+        necesidad_ctx["proforma_recibida"] = True
+
+        if tipo_mensaje == "link_documento":
+            necesidad_ctx["archivo_proforma"] = mensaje
+
+        return {
+            "handled": True,
+            "respuesta": (
+                "Perfecto, tomo esto como proforma recibida. "
+                "¿Deseas proceder con el pago?"
+            ),
+            "etapa": "proforma_enviada",
+            "cliente": cliente,
+            "necesidad_ctx": necesidad_ctx,
+            "productos_acumulados": productos_acumulados,
+        }
+
+    # ============================================================
+    # Cliente valida proforma para pago
+    # ============================================================
+    if etapa == "proforma_enviada":
+        if _es_confirmacion_afirmativa(mensaje):
+            return {
+                "handled": True,
+                "respuesta": (
+                    "Perfecto. Puedes continuar con el pago por transferencia, PSE o tarjeta. "
+                    "Un asesor confirmará el pago y cerrará el proceso."
+                ),
+                "etapa": "pago",
+                "cliente": cliente,
+                "necesidad_ctx": necesidad_ctx,
+                "productos_acumulados": productos_acumulados,
+            }
+            
+        if _es_confirmacion_negativa(mensaje):
+            return {
+                "handled": True,
+                "respuesta": (
+                    "Entiendo. Indícame qué ajuste necesitas en la proforma "
+                    "para que el asesor pueda revisarlo."
+                ),
+                "etapa": "proforma",
+                "cliente": cliente,
+                "necesidad_ctx": necesidad_ctx,
+                "productos_acumulados": productos_acumulados,
+            }
+
+        return {
+            "handled": True,
+            "respuesta": "¿Deseas proceder con el pago?",
+            "etapa": "proforma_enviada",
+            "cliente": cliente,
+            "necesidad_ctx": necesidad_ctx,
+            "productos_acumulados": productos_acumulados,
+        }
+        
+    # ============================================================
+    # Proforma lista, esperando confirmación externa
+    # ============================================================
+    if etapa == "proforma_lista":
+        cliente = _capturar_dato_comercial_por_etapa(
+            mensaje=mensaje,
+            cliente=cliente,
+            etapa="proforma_lista",
+        )
+
+        rut_valor = _extraer_rut_desde_mensaje(mensaje)
+        if rut_valor and cliente.get("rut") in {None, "", "pendiente"}:
+            cliente["rut"] = rut_valor
+            logger.debug("RUT actualizado en proforma_lista: %s", rut_valor)
+
+        if rut_valor:
+            return {
+                "handled": True,
+                "respuesta": (
+                    "Gracias, recibí el RUT y lo dejo asociado a la solicitud. "
+                    "La proforma queda lista para revisión del asesor. "
+                    "Cuando recibas la proforma, me confirmas si deseas proceder con el pago."
+                ),
+                "etapa": "proforma_lista",
+                "cliente": cliente,
+                "necesidad_ctx": necesidad_ctx,
+                "productos_acumulados": productos_acumulados,
+            }
+
+        return {
+            "handled": True,
+            "respuesta": (
+                "La proforma ya quedó lista para revisión del asesor. "
+                "Cuando recibas la proforma, me confirmas si deseas proceder con el pago."
+            ),
+            "etapa": "proforma_lista",
+            "cliente": cliente,
+            "necesidad_ctx": necesidad_ctx,
+            "productos_acumulados": productos_acumulados,
+        }
+        
+        
+        
     # 1) Producto encontrado: NIA espera confirmación explícita.
     if etapa == "producto_encontrado":
         if _es_confirmacion_afirmativa(mensaje):
@@ -1880,6 +2324,20 @@ async def procesar_turno(
 
     if mensaje.strip():
         cliente = extraer_datos_cliente(mensaje, cliente)
+    
+    # ------------------------------------------------------------
+    # Clasificación de intención — Cotización V
+    # ------------------------------------------------------------
+    clasificacion = await clasificar_mensaje(mensaje, etapa)
+
+    logger.info(
+        "Clasificación mensaje: session=%s etapa=%s tipo=%s confianza=%s razon=%s",
+        session_id,
+        etapa,
+        clasificacion.get("tipo"),
+        clasificacion.get("confianza"),
+        clasificacion.get("razon"),
+    )
         
     # ══════════════════════════════════════════════════════
     # PRIORIDAD ABSOLUTA: ESTADO COMERCIAL
@@ -1893,6 +2351,7 @@ async def procesar_turno(
             cliente=cliente,
             productos_acumulados=productos_acumulados,
             necesidad_ctx=necesidad_ctx,
+            clasificacion=clasificacion,
         )
 
         if comercial and comercial.get("handled"):
@@ -1903,6 +2362,8 @@ async def procesar_turno(
                 comercial["etapa"],
             )
 
+            necesidad_comercial = comercial.get("necesidad_ctx", {}) or {}
+
             return await _guardar_y_responder_turno(
                 session_id=session_id,
                 phone_id=phone_id,
@@ -1912,13 +2373,21 @@ async def procesar_turno(
                 etapa=comercial["etapa"],
                 cliente=comercial["cliente"],
                 productos_acumulados=comercial["productos_acumulados"],
-                necesidad_ctx=comercial.get("necesidad_ctx", {}),
+                necesidad_ctx=necesidad_comercial,
                 archivo_activo=archivo_activo,
                 items_resultado=None,
-                cotizacion_recibida=cotizacion_recibida,
-                archivo_cotizacion=archivo_cotizacion,
-                proforma_recibida=proforma_recibida,
-                archivo_proforma=archivo_proforma,
+                cotizacion_recibida=bool(
+                    necesidad_comercial.get("cotizacion_recibida", cotizacion_recibida)
+                ),
+                archivo_cotizacion=necesidad_comercial.get(
+                    "archivo_cotizacion", archivo_cotizacion
+                ),
+                proforma_recibida=bool(
+                    necesidad_comercial.get("proforma_recibida", proforma_recibida)
+                ),
+                archivo_proforma=necesidad_comercial.get(
+                    "archivo_proforma", archivo_proforma
+                ),
             )
 
     # ══════════════════════════════════════════════════════
@@ -2292,7 +2761,7 @@ async def procesar_turno(
         session_id=session_id,
         phone_id=phone_id,
         turnos=historial + [turno_user, turno_nia],
-        etapa=etapa,
+        etapa=nueva_etapa,
         archivo_activo=archivo_activo,
         necesidad_ctx=necesidad_ctx or {},
         cliente=cliente or {},
