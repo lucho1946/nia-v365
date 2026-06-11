@@ -21,3 +21,9 @@ nia.log
 # Sistema
 .DS_Store
 Thumbs.db
+
+# Archivos temporales de conocimiento técnico / libros
+_incoming_conocimiento_nia/
+*.jsonl
+*.xlsx
+*.html
