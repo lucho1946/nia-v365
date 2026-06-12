@@ -48,6 +48,7 @@ from catalog import (
     buscar_con_campos,
     evaluar_coincidencia,
     formatear_producto,
+    debe_preguntar_tipo_producto,
 )
 from product_matcher import validar_compatibilidad_producto
 from file_processor import procesar_archivo
@@ -427,7 +428,7 @@ Clasifica el mensaje.
             "confianza": 0.0,
             "razon": "fallback por error del clasificador",
         }
-        
+
 PALABRAS_SALUDO = {"hola", "buenas", "buenos", "buen", "hi", "hello", "hey", "saludos"}
 PALABRAS_MAS = {"también", "otro", "otra", "más", "adicional", "y además", "necesito más", "y también"}
 PALABRAS_FIN = {"solo eso", "con eso", "es todo", "nada más", "eso es todo", "listo", "ok cotiza", "cotiza"}
@@ -1279,7 +1280,88 @@ def _respuesta_pregunta_tecnica_unica(
         "Gracias. Ahora necesito confirmar lo siguiente:\n\n"
         f"{pregunta}"
     )
-    
+
+def _crear_ctx_tipo_producto(
+    texto_original: str,
+    tipos_detectados: list[str],
+) -> dict:
+    """
+    Crea el contexto conversacional para cuando NIA necesita confirmar
+    primero el tipo/familia de producto.
+
+    Este estado es diferente a preguntas_tecnicas:
+    - tipo_producto: pregunta por rama del catálogo.
+    - preguntas_tecnicas: pregunta por especificaciones de aplicación.
+    """
+    tipos_limpios = [
+        str(t).strip()
+        for t in tipos_detectados or []
+        if str(t).strip()
+    ][:5]
+
+    return {
+        "texto_original": texto_original,
+        "tipos_detectados": tipos_limpios,
+        "tipo_confirmado": None,
+    }
+
+
+def _respuesta_pregunta_tipo_producto(
+    texto_original: str,
+    tipos_detectados: list[str],
+) -> str:
+    """
+    Construye una pregunta natural para confirmar tipo de producto.
+
+    Regla Don Andrés:
+    - No inventar tipos.
+    - Solo mostrar opciones detectadas desde catálogo real.
+    - Hacer una sola pregunta.
+    - Mostrar opciones de forma limpia y legible.
+    """
+    tipos_limpios = []
+
+    for tipo in tipos_detectados or []:
+        tipo_limpio = str(tipo).strip()
+
+        if not tipo_limpio:
+            continue
+
+        # Limpieza visual defensiva.
+        # No cambia la lógica del catálogo; solo mejora cómo se muestra.
+        tipo_limpio = re.sub(r"\s+", " ", tipo_limpio).strip()
+
+        # Correcciones visuales comunes por textos taxonómicos pegados.
+        tipo_limpio = tipo_limpio.replace("portatilesbolsillo", "portatiles bolsillo")
+        tipo_limpio = tipo_limpio.replace("digitalesportatiles", "digitales portatiles")
+
+        if tipo_limpio not in tipos_limpios:
+            tipos_limpios.append(tipo_limpio)
+
+        if len(tipos_limpios) >= 5:
+            break
+
+    if not tipos_limpios:
+        return (
+            "Para ayudarte mejor, necesito confirmar primero el tipo de producto. "
+            "¿Qué variante o aplicación específica necesitas?"
+        )
+
+    if len(tipos_limpios) == 1:
+        opciones = tipos_limpios[0]
+    elif len(tipos_limpios) == 2:
+        opciones = f"{tipos_limpios[0]} o {tipos_limpios[1]}"
+    else:
+        opciones = ", ".join(tipos_limpios[:-1]) + f" o {tipos_limpios[-1]}"
+
+    producto_base = (texto_original or "producto").strip()
+    producto_base = re.sub(r"\s+", " ", producto_base)
+
+    return (
+        f"Encontré varias líneas relacionadas con {producto_base} en el catálogo. "
+        f"¿Qué tipo necesitas: {opciones}?"
+    )
+
 def construir_respuesta_desde_resultado(
     res: dict,
     cliente: dict,
@@ -1886,7 +1968,7 @@ def _respuesta_siguiente_dato_comercial(
     # - vendedor confirmó que envió la cotización;
     # - cliente confirmó que cumple técnicamente.
     #==============================================================
-    
+
     if etapa_objetivo == "proforma":
         if not cliente.get("empresa"):
             return (
@@ -2023,7 +2105,7 @@ def _manejar_estado_comercial_prioritario(
     cliente = dict(cliente or {})
     necesidad_ctx = dict(necesidad_ctx or {})
     productos_acumulados = productos_acumulados or []
-    
+
     clasificacion = clasificacion or {}
     tipo_mensaje = clasificacion.get("tipo")
 
@@ -2144,7 +2226,7 @@ def _manejar_estado_comercial_prioritario(
                 "necesidad_ctx": necesidad_ctx,
                 "productos_acumulados": productos_acumulados,
             }
-            
+
         if _es_confirmacion_negativa(mensaje):
             return {
                 "handled": True,
@@ -2166,7 +2248,7 @@ def _manejar_estado_comercial_prioritario(
             "necesidad_ctx": necesidad_ctx,
             "productos_acumulados": productos_acumulados,
         }
-        
+
     # ============================================================
     # Proforma lista, esperando confirmación externa
     # ============================================================
@@ -2205,9 +2287,9 @@ def _manejar_estado_comercial_prioritario(
             "necesidad_ctx": necesidad_ctx,
             "productos_acumulados": productos_acumulados,
         }
-        
-        
-        
+
+
+
     # 1) Producto encontrado: NIA espera confirmación explícita.
     if etapa == "producto_encontrado":
         if _es_confirmacion_afirmativa(mensaje):
@@ -2364,7 +2446,7 @@ async def _persistir_cliente_permanente(
             phone_id,
             e,
         )
-        
+
 async def _guardar_y_responder_turno(
     session_id: str,
     phone_id: Optional[str],
@@ -2400,7 +2482,7 @@ async def _guardar_y_responder_turno(
     }
 
     await _persistir_cliente_permanente(phone_id, cliente)
-    
+
     await save_session(
         session_id=session_id,
         phone_id=phone_id,
@@ -2422,7 +2504,7 @@ async def _guardar_y_responder_turno(
         "items_resultado": items_resultado or None,
         "cliente": cliente or None,
     }
-    
+
 # ─────────────────────────────────────────────────────────────
 # Núcleo conversacional
 # ─────────────────────────────────────────────────────────────
@@ -2498,7 +2580,7 @@ async def procesar_turno(
 
     if mensaje.strip():
         cliente = extraer_datos_cliente(mensaje, cliente)
-    
+
     # ------------------------------------------------------------
     # Clasificación de intención — Cotización V
     # ------------------------------------------------------------
@@ -2512,7 +2594,7 @@ async def procesar_turno(
         clasificacion.get("confianza"),
         clasificacion.get("razon"),
     )
-        
+
     # ══════════════════════════════════════════════════════
     # PRIORIDAD ABSOLUTA: ESTADO COMERCIAL
     # ══════════════════════════════════════════════════════
@@ -2650,7 +2732,7 @@ async def procesar_turno(
     elif mensaje.strip():
         msg_lower = mensaje.lower().strip()
         estado_comercial_resuelto = False
-        
+
         # El estado comercial se resuelve antes de entrar al modo texto.
         # Si llegó hasta aquí, este turno puede pasar a archivo/catálogo/LLM.
 
@@ -2730,6 +2812,102 @@ async def procesar_turno(
                     },
                 )
 
+        # Caso 2B: respuesta a pregunta por tipo de producto
+        # Este flujo se activa cuando el catálogo detectó varias ramas reales
+        # para una familia genérica. Ejemplo:
+        # - termometro -> digitales portatiles bolsillo / punzon
+        # - transmisor -> temperatura / senales
+        elif etapa == "esperando_tipo_producto" and necesidad_ctx.get("tipos_detectados"):
+            texto_original = (
+                necesidad_ctx.get("texto_original")
+                or necesidad_ctx.get("query_evaluada")
+                or ""
+            )
+
+            tipo_confirmado = mensaje.strip()
+            query_e = f"{texto_original} {tipo_confirmado}".strip()
+
+            res = await buscar_en_catalogo(query_e)
+
+            if debe_intentar_enriquecimiento(res):
+                res = await enriquecer_y_buscar(query_e)
+
+            # ------------------------------------------------------------
+            # Si con el tipo confirmado encontramos SKU exacto, respondemos
+            # con producto real del catálogo.
+            # ------------------------------------------------------------
+            if res.get("estado") == "encontrado" and res.get("producto"):
+                contexto_extra, nueva_etapa, necesidad_ctx = construir_respuesta_desde_resultado(
+                    res=res,
+                    cliente=cliente,
+                    productos_acumulados=productos_acumulados,
+                    desde="tipo_producto",
+                    necesidad_ctx_base={
+                        "texto_original": texto_original,
+                        "query_evaluada": query_e,
+                        "tipos_detectados": necesidad_ctx.get("tipos_detectados", []),
+                        "tipo_confirmado": tipo_confirmado,
+                    },
+                )
+
+            else:
+                # ------------------------------------------------------------
+                # Si ya confirmó el tipo, pero aún no hay coincidencia exacta,
+                # no volvemos a pedir "tipo de producto".
+                #
+                # Regla general:
+                # - El cliente ya eligió una rama del catálogo.
+                # - Si falta precisión para llegar a SKU, pasamos a preguntas
+                #   técnicas secuenciales.
+                # - Máximo 3 preguntas, una por turno.
+                # ------------------------------------------------------------
+                preguntas = []
+
+                try:
+                    preguntas = _limpiar_preguntas_tecnicas(
+                        await generar_preguntas(query_e)
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "No fue posible generar preguntas tras confirmar tipo de producto: %s",
+                        e,
+                    )
+                    preguntas = []
+
+                if preguntas:
+                    necesidad_ctx = _crear_ctx_preguntas_secuenciales(
+                        texto_original=query_e,
+                        preguntas=preguntas,
+                        necesidad_ctx_base={
+                            "texto_original": query_e,
+                            "query_evaluada": query_e,
+                            "tipos_detectados": necesidad_ctx.get("tipos_detectados", []),
+                            "tipo_confirmado": tipo_confirmado,
+                        },
+                    )
+
+                    contexto_extra = _marcar_respuesta_segura(
+                        _respuesta_pregunta_tecnica_unica(
+                            preguntas[0],
+                            primera=True,
+                        )
+                    )
+
+                    nueva_etapa = "descubrimiento"
+
+                else:
+                    contexto_extra = _marcar_respuesta_segura(
+                        "Ya tengo claro el tipo de producto. Para llegar a una referencia más precisa, "
+                        "necesito una especificación adicional. ¿Qué rango, aplicación o condición de instalación debe cumplir?"
+                    )
+
+                    nueva_etapa = "descubrimiento"
+                    necesidad_ctx = {
+                        "texto_original": query_e,
+                        "query_evaluada": query_e,
+                        "tipos_detectados": necesidad_ctx.get("tipos_detectados", []),
+                        "tipo_confirmado": tipo_confirmado,
+                    }
         # Caso 3A: preguntas técnicas secuenciales
         # NIA tiene hasta 3 preguntas guardadas, pero solo muestra una por turno.
         elif etapa == "descubrimiento" and necesidad_ctx.get("preguntas_tecnicas"):
@@ -2804,7 +2982,7 @@ async def procesar_turno(
                         "query_evaluada": query_e,
                     },
                 )
-                
+
         # Caso 3: respuesta a preguntas de descubrimiento
         elif etapa == "descubrimiento" and necesidad_ctx.get("texto_original"):
             query_e = f"{necesidad_ctx['texto_original']} {mensaje}".strip()
@@ -2833,6 +3011,7 @@ async def procesar_turno(
 
                 if preguntas:
                     texto_original = necesidad_ctx.get("texto_original")
+
                     necesidad_ctx = _crear_ctx_preguntas_secuenciales(
                         texto_original=texto_original,
                         preguntas=preguntas,
@@ -2885,54 +3064,76 @@ async def procesar_turno(
                 )
 
             else:
-                nec = await evaluar_necesidad(mensaje)
+                productos_tipo = await buscar_por_texto(mensaje) or []
 
-                if nec["clara"]:
-                    res = await buscar_en_catalogo(mensaje)
+                debe_preguntar_tipo, tipos_detectados = debe_preguntar_tipo_producto(
+                    texto_cliente=mensaje,
+                    productos=productos_tipo,
+                )
 
-                    if debe_intentar_enriquecimiento(res):
-                        res = await enriquecer_y_buscar(mensaje)
+                if debe_preguntar_tipo:
+                    contexto_extra = _marcar_respuesta_segura(
+                        _respuesta_pregunta_tipo_producto(
+                            texto_original=mensaje,
+                            tipos_detectados=tipos_detectados,
+                        )
+                    )
 
-                    contexto_extra, nueva_etapa, necesidad_ctx = construir_respuesta_desde_resultado(
-                        res=res,
-                        cliente=cliente,
-                        productos_acumulados=productos_acumulados,
-                        desde="busqueda",
-                        necesidad_ctx_base={
-                            "texto_original": mensaje,
-                            "query_evaluada": mensaje,
-                        },
+                    nueva_etapa = "esperando_tipo_producto"
+                    necesidad_ctx = _crear_ctx_tipo_producto(
+                        texto_original=mensaje,
+                        tipos_detectados=tipos_detectados,
                     )
 
                 else:
-                    preguntas = _limpiar_preguntas_tecnicas(nec.get("preguntas", []))
+                    nec = await evaluar_necesidad(mensaje)
 
-                    if preguntas:
-                        necesidad_ctx = _crear_ctx_preguntas_secuenciales(
-                            texto_original=mensaje,
-                            preguntas=preguntas,
+                    if nec["clara"]:
+                        res = await buscar_en_catalogo(mensaje)
+
+                        if debe_intentar_enriquecimiento(res):
+                            res = await enriquecer_y_buscar(mensaje)
+
+                        contexto_extra, nueva_etapa, necesidad_ctx = construir_respuesta_desde_resultado(
+                            res=res,
+                            cliente=cliente,
+                            productos_acumulados=productos_acumulados,
+                            desde="busqueda",
                             necesidad_ctx_base={
                                 "texto_original": mensaje,
-                                "dominio": nec.get("dominio"),
+                                "query_evaluada": mensaje,
                             },
                         )
 
-                        contexto_extra = _marcar_respuesta_segura(
-                            _respuesta_pregunta_tecnica_unica(
-                                preguntas[0],
-                                primera=True,
-                            )
-                        )
                     else:
-                        contexto_extra = _marcar_respuesta_segura(
-                            "Necesito un poco más de información para buscar la opción adecuada. "
-                            "¿Puedes indicarme la aplicación o especificación principal?"
-                        )
-                        necesidad_ctx = {"texto_original": mensaje}
+                        preguntas = _limpiar_preguntas_tecnicas(nec.get("preguntas", []))
 
-                    nueva_etapa = "descubrimiento"
+                        if preguntas:
+                            necesidad_ctx = _crear_ctx_preguntas_secuenciales(
+                                texto_original=mensaje,
+                                preguntas=preguntas,
+                                necesidad_ctx_base={
+                                    "texto_original": mensaje,
+                                    "dominio": nec.get("dominio"),
+                                },
+                            )
 
-       
+                            contexto_extra = _marcar_respuesta_segura(
+                                _respuesta_pregunta_tecnica_unica(
+                                    preguntas[0],
+                                    primera=True,
+                                )
+                            )
+                        else:
+                            contexto_extra = _marcar_respuesta_segura(
+                                "Necesito un poco más de información para buscar la opción adecuada. "
+                                "¿Puedes indicarme la aplicación o especificación principal?"
+                            )
+                            necesidad_ctx = {"texto_original": mensaje}
+
+                        nueva_etapa = "descubrimiento"
+
+
         # Intenciones comerciales transversales
         # Solo se aplican si el estado comercial prioritario no resolvió el turno.
         # Esto evita que datos como cantidad, nombre, empresa o NIT sean tratados
@@ -3052,7 +3253,7 @@ async def procesar_turno(
         "content": respuesta,
         "ts": datetime.utcnow().isoformat(),
     }
-    
+
     await _persistir_cliente_permanente(phone_id, cliente)
 
     await save_session(
@@ -3069,7 +3270,7 @@ async def procesar_turno(
         proforma_recibida=proforma_recibida,
         archivo_proforma=archivo_proforma,
     )
-    
+
 
     return {
         "respuesta": respuesta,
