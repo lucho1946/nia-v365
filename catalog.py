@@ -1048,24 +1048,59 @@ def evaluar_coincidencia(
 # FORMATO DE RESPUESTA
 # ============================================================
 
+def _numero_seguro_catalogo(valor) -> float:
+    """
+    Convierte un valor de stock a float de forma segura.
+    Si no se puede convertir, retorna 0.0.
+    """
+    if valor is None:
+        return 0.0
+
+    try:
+        texto = str(valor).strip().replace(",", ".")
+        if not texto:
+            return 0.0
+        return float(texto)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _disponibilidad_catalogo(p: dict) -> str:
+    """
+    Construye disponibilidad visible para respuestas originadas desde catalog.py.
+
+    En la data actual, 'existencia' representa tiempo de entrega.
+    No debe mostrarse como existencia física.
+    """
+    stock_total = _numero_seguro_catalogo(p.get("stock_total"))
+    tiempo_entrega = str(p.get("existencia") or "").strip()
+
+    if stock_total > 0:
+        return f"Disponibilidad: stock disponible ({stock_total:g} unidades)"
+
+    if tiempo_entrega:
+        return f"Tiempo de entrega estimado: {tiempo_entrega}"
+
+    return "Disponibilidad: a confirmar con asesor"
+
+
 def formatear_producto(p: dict) -> str:
     """
     Formatea un producto para mostrarlo al cliente.
 
     Nunca usa placeholders tipo [código] o [marca].
     Si falta un dato real, muestra 'No disponible'.
+
+    Nota:
+    El campo 'existencia' se muestra como tiempo de entrega estimado,
+    porque no representa stock físico.
     """
     codigo = p.get("codigo") or "No disponible"
     referencia = p.get("referencia") or "No disponible"
     nombre = p.get("nombre") or "No disponible"
     marca = p.get("marca") or "No disponible"
     desc = p.get("descripcion_corta") or p.get("descripcion") or "No disponible"
-    existencia = p.get("existencia") or "No disponible"
-    stock_total = p.get("stock_total")
-
-    stock_texto = "No disponible"
-    if stock_total is not None:
-        stock_texto = str(stock_total)
+    disponibilidad = _disponibilidad_catalogo(p)
 
     return (
         f"Código: {codigo}\n"
@@ -1073,6 +1108,5 @@ def formatear_producto(p: dict) -> str:
         f"Nombre: {nombre}\n"
         f"Marca: {marca}\n"
         f"Descripción: {desc}\n"
-        f"Existencia: {existencia}\n"
-        f"Stock total: {stock_texto}"
+        f"{disponibilidad}"
     )
