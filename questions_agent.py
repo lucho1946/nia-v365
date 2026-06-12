@@ -18,7 +18,7 @@ import os
 import re
 import logging
 import httpx
-from knowledge import contexto_para_agente
+from knowledge import construir_contexto_tecnico_para_nia
 from product_fields import get_campos, detectar_categoria, CAMPOS_POR_CATEGORIA
 
 logger = logging.getLogger("nia.questions_agent")
@@ -116,29 +116,164 @@ Genera 3 preguntas en este orden:
 
 Adapta las preguntas al contexto del cliente."""
 
-def _prompt_escenario_3(texto: str, dominio: str, extractos: list, campos: dict) -> str:
-    contexto_libros = ""
-    if extractos:
-        contexto_libros = f"\nContexto técnico (Creus/Kuphaldt — dominio {dominio}):\n"
-        for e in extractos[:2]:
-            contexto_libros += f"- {e[:250]}\n"
+def _normalizar_texto_simple(texto: str) -> str:
+    """
+    Normalización liviana para validar si el contexto técnico recuperado
+    realmente tiene relación con la consulta del cliente.
+
+    No se usa para responder al cliente.
+    Solo sirve como guardrail interno.
+    """
+    import re
+    import unicodedata
+
+    texto = (texto or "").lower().strip()
+    texto = unicodedata.normalize("NFD", texto)
+    texto = "".join(c for c in texto if unicodedata.category(c) != "Mn")
+    texto = re.sub(r"[^a-z0-9ñ\s/-]", " ", texto)
+    texto = re.sub(r"\s+", " ", texto).strip()
+
+    return texto
+
+
+def _tokens_tecnicos_consulta(texto: str) -> set[str]:
+    """
+    Extrae tokens útiles de la consulta del cliente para validar relevancia.
+
+    Evita usar palabras demasiado generales como:
+    necesito, producto, equipo, proceso, industrial, etc.
+    """
+    texto_norm = _normalizar_texto_simple(texto)
+
+    stopwords = {
+        "necesito",
+        "quiero",
+        "busco",
+        "tengo",
+        "para",
+        "con",
+        "sin",
+        "una",
+        "uno",
+        "unos",
+        "unas",
+        "del",
+        "los",
+        "las",
+        "que",
+        "como",
+        "cual",
+        "cuales",
+        "producto",
+        "equipo",
+        "instrumento",
+        "instrumentos",
+        "industrial",
+        "proceso",
+        "linea",
+        "línea",
+        "usar",
+        "saber",
+        "automatizar",  # demasiado amplio para usarlo como prueba de relevancia
+    }
+
+    tokens = set()
+
+    for token in texto_norm.split():
+        token = token.strip()
+
+        if len(token) < 4:
+            continue
+
+        if token in stopwords:
+            continue
+
+        tokens.add(token)
+
+    return tokens
+
+
+def _contexto_tecnico_es_util(
+    texto_cliente: str,
+    contexto_tecnico: str,
+    dominio: str | None = None,
+) -> bool:
+    """
+    Decide si el contexto recuperado desde libros debe entrar al prompt.
+
+    Regla:
+    - Si la consulta es demasiado genérica, no usar contexto.
+    - Si el contexto no comparte tokens técnicos con la consulta, no usarlo.
+    - Si el dominio fue inferido pero el texto del contexto no lo soporta, no usarlo.
+
+    Esto evita contaminar preguntas con fragmentos irrelevantes.
+    """
+    contexto_norm = _normalizar_texto_simple(contexto_tecnico)
+    tokens = _tokens_tecnicos_consulta(texto_cliente)
+
+    if not contexto_norm:
+        return False
+
+    # Si no hay suficientes tokens técnicos en la consulta, es mejor NO usar libros.
+    # Ejemplo: "necesito automatizar una línea de proceso y no sé qué instrumento usar"
+    # es muy general; debe generar preguntas abiertas, no traer fragmentos forzados.
+    if len(tokens) < 2:
+        return False
+
+    coincidencias = [token for token in tokens if token in contexto_norm]
+
+    if len(coincidencias) >= 2:
+        return True
+
+    # Casos técnicos cortos pero válidos.
+    # Ejemplo: "pH", "RTD", "PT100", "PLC", "Modbus".
+    tokens_especiales = {"ph", "rtd", "pt100", "plc", "modbus", "hart", "orp"}
+
+    if tokens_especiales.intersection(tokens) and tokens_especiales.intersection(set(contexto_norm.split())):
+        return True
+
+    return False
+
+def _prompt_escenario_3(texto: str,dominio: str,contexto_tecnico: str,campos: dict,) -> str:
+    """
+    Prompt para cuando el cliente solo expresa una necesidad.
+
+    Usa contexto técnico recuperado desde MongoDB/libros industriales
+    únicamente como apoyo para formular mejores preguntas.
+    No recomienda productos y no reemplaza el catálogo.
+    """
+    bloque_contexto = ""
+
+    if contexto_tecnico:
+        # No metemos contexto infinito al prompt.
+        # Solo damos una muestra controlada para orientar preguntas.
+        contexto_recortado = contexto_tecnico[:1600].strip()
+
+        bloque_contexto = f"""
+Contexto técnico recuperado desde libros industriales:
+{contexto_recortado}
+
+Usa este contexto SOLO para formular mejores preguntas técnicas.
+No cites los libros.
+No recomiendes productos.
+No inventes compatibilidad.
+"""
 
     return f"""{SYSTEM_BASE}
 
 ESCENARIO: El cliente solo tiene la necesidad. No sabe el nombre del producto.
 Lo que dijo: "{texto}"
 Dominio técnico detectado: {dominio}
-{contexto_libros}
+{bloque_contexto}
 
 Campos del catálogo que llevan al producto:
 - Q2 (rango/condición): {campos['campos_q2']}
 - Q3 (interfaz/material): {campos['campos_q3']}
 
 Genera 3 preguntas en este orden:
-1. Proceso completo: qué mide/controla, dónde va instalado, qué fluido/material
-   (Esta pregunta identifica la FAMILIA TÉCNICA y el principio de medición)
-2. Rango + condiciones del proceso (temperatura, presión, tamaño)
-3. Señal de salida + entorno de instalación (protocolo, área clasificada, material)
+1. Proceso completo: qué mide/controla, dónde va instalado, qué fluido/material.
+2. Rango + condiciones del proceso: temperatura, presión, tamaño, capacidad o escala.
+3. Señal de salida + entorno de instalación: protocolo, área clasificada, material o conexión.
 
 El objetivo es llegar al SKU exacto en máximo 3 preguntas."""
 
@@ -224,10 +359,48 @@ async def generar_preguntas(texto_cliente: str) -> list:
 
     logger.info(f"questions_agent: escenario={escenario} categoría={categoria}")
 
-    # Obtener contexto de los libros
-    ctx      = contexto_para_agente(texto_cliente)
-    dominio  = ctx.get("dominio", campos.get("dominio", "general"))
-    extractos = ctx.get("extractos", [])
+    # ------------------------------------------------------------
+    # Contexto técnico desde libros industriales
+    # ------------------------------------------------------------
+    # Solo lo usamos para escenario_3_necesidad.
+    # No debe interferir cuando el cliente ya trae código, referencia,
+    # características claras o nombre de producto.
+    dominio = campos.get("dominio", "general")
+    contexto_tecnico = ""
+
+    if escenario == "escenario_3_necesidad":
+        try:
+            paquete_tecnico = await construir_contexto_tecnico_para_nia(
+                texto_cliente,
+                limit=3,
+                max_chars_por_fragmento=500,
+            )
+
+            if paquete_tecnico.get("ok"):
+                dominio_candidato = paquete_tecnico.get("domain") or dominio
+                contexto_candidato = paquete_tecnico.get("contexto") or ""
+
+                if _contexto_tecnico_es_util(
+                    texto_cliente,
+                    contexto_candidato,
+                    dominio_candidato,
+                ):
+                    dominio = dominio_candidato
+                    contexto_tecnico = contexto_candidato
+                else:
+                    logger.info(
+                        "Contexto técnico descartado por baja relevancia: dominio=%s texto=%s",
+                        dominio_candidato,
+                        texto_cliente[:80],
+                    )
+                    contexto_tecnico = ""
+
+        except Exception as e:
+            logger.warning(
+                "No se pudo construir contexto técnico para preguntas: %s",
+                e,
+            )
+            contexto_tecnico = ""
 
     # Construir prompt según escenario
     if escenario == "escenario_1_codigo":
@@ -241,7 +414,7 @@ async def generar_preguntas(texto_cliente: str) -> list:
         prompt = _prompt_escenario_2(texto_cliente, categoria, campos)
 
     else:  # escenario_3_necesidad
-        prompt = _prompt_escenario_3(texto_cliente, dominio, extractos, campos)
+        prompt = _prompt_escenario_3(texto_cliente, dominio, contexto_tecnico, campos,)
 
     # Llamar a OpenAI
     respuesta = await _llamar_openai(prompt)
