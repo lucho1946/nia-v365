@@ -1204,7 +1204,82 @@ def _marcar_respuesta_segura(texto: str) -> str:
     """
     return "[RESPUESTA_SEGURA]\n" + texto
 
+def _limpiar_preguntas_tecnicas(preguntas: list) -> list[str]:
+    """
+    Limpia y limita preguntas técnicas a máximo 3.
 
+    - NIA puede tener hasta 3 preguntas técnicas.
+    - Pero debe hacer una sola pregunta por mensaje.
+    """
+    preguntas_limpias = []
+
+    for pregunta in preguntas or []:
+        if not isinstance(pregunta, str):
+            continue
+
+        p = pregunta.strip()
+
+        if not p:
+            continue
+
+        # Limpieza defensiva por si el LLM devuelve numeración.
+        p = re.sub(r"^\s*(\d+[\.\)]|[-*•])\s*", "", p).strip()
+
+        if p:
+            preguntas_limpias.append(p)
+
+    return preguntas_limpias[:3]
+
+
+def _crear_ctx_preguntas_secuenciales(
+    texto_original: str,
+    preguntas: list[str],
+    necesidad_ctx_base: Optional[dict] = None,
+) -> dict:
+    """
+    Crea el estado conversacional para hacer preguntas técnicas una por una.
+
+    Estructura:
+    - texto_original: necesidad inicial del cliente.
+    - preguntas_tecnicas: lista completa de preguntas.
+    - pregunta_actual_idx: índice de la pregunta que NIA acaba de enviar.
+    - respuestas_tecnicas: respuestas que va dando el cliente.
+    """
+    necesidad_ctx_base = necesidad_ctx_base or {}
+
+    return {
+        **necesidad_ctx_base,
+        "texto_original": texto_original,
+        "preguntas_tecnicas": preguntas,
+        "pregunta_actual_idx": 0,
+        "respuestas_tecnicas": [],
+    }
+
+
+def _respuesta_pregunta_tecnica_unica(
+    pregunta: str,
+    primera: bool = False,
+) -> str:
+    """
+    Construye una respuesta segura con UNA sola pregunta técnica.
+
+    No enumera 3 preguntas.
+    No muestra bloques largos.
+    Mantiene conversación natural.
+    """
+    pregunta = (pregunta or "").strip()
+
+    if primera:
+        return (
+            "Entiendo. Para ayudarte mejor, necesito confirmar primero este dato:\n\n"
+            f"{pregunta}"
+        )
+
+    return (
+        "Gracias. Ahora necesito confirmar lo siguiente:\n\n"
+        f"{pregunta}"
+    )
+    
 def construir_respuesta_desde_resultado(
     res: dict,
     cliente: dict,
@@ -1221,12 +1296,32 @@ def construir_respuesta_desde_resultado(
     Reglas:
     - encontrado: se agrega al carrito.
     - relacionado: no se agrega al carrito; se pide confirmación.
-    - sin_resultado/pendiente: se mantiene descubrimiento.
+    - pendiente/sin_resultado/no_compatible: se mantiene descubrimiento.
+    - nunca debe retornar None.
     """
     necesidad_ctx_base = necesidad_ctx_base or {}
 
+    # Defensive: si llega algo no dict, no rompemos el flujo.
+    if not isinstance(res, dict):
+        return (
+            _marcar_respuesta_segura(
+                respuesta_sin_resultado(
+                    pregunta_sugerida=(
+                        "¿Puedes indicarme una referencia, aplicación exacta "
+                        "o especificación técnica adicional?"
+                    ),
+                    cliente=cliente,
+                )
+            ),
+            "descubrimiento",
+            necesidad_ctx_base,
+        )
+
     estado = res.get("estado")
 
+    # ------------------------------------------------------------
+    # 1) Producto encontrado
+    # ------------------------------------------------------------
     if estado == "encontrado" and res.get("producto"):
         producto = res["producto"]
 
@@ -1238,52 +1333,67 @@ def construir_respuesta_desde_resultado(
         })
 
         return (
-            _marcar_respuesta_segura(respuesta_producto_encontrado(producto, cliente)),
+            _marcar_respuesta_segura(
+                respuesta_producto_encontrado(producto, cliente)
+            ),
             "producto_encontrado",
             {},
         )
 
+    # ------------------------------------------------------------
+    # 2) Producto relacionado
+    # ------------------------------------------------------------
     if estado == "relacionado" and res.get("producto"):
         producto = res["producto"]
 
-        # Esta función es síncrona, por eso aquí NO usamos await.
-        # Si existen preguntas técnicas, deben venir preparadas desde
-        # buscar_en_catalogo(), que sí es async.
-        preguntas_tecnicas = res.get("preguntas_tecnicas") or []
+        preguntas_limpias = _limpiar_preguntas_tecnicas(
+            res.get("preguntas_tecnicas") or []
+        )
 
-        respuesta_base = respuesta_producto_relacionado(
+        # Si hay preguntas técnicas, no las mandamos todas juntas.
+        # Guardamos la lista completa y mostramos solo la primera.
+        if preguntas_limpias:
+            texto_original = (
+                necesidad_ctx_base.get("texto_original")
+                or necesidad_ctx_base.get("query_evaluada")
+                or ""
+            )
+
+            necesidad_ctx = _crear_ctx_preguntas_secuenciales(
+                texto_original=texto_original,
+                preguntas=preguntas_limpias,
+                necesidad_ctx_base={
+                    **necesidad_ctx_base,
+                    "producto_relacionado": producto,
+                    "pregunta_sugerida": res.get("pregunta_sugerida"),
+                    "razon": res.get("razon"),
+                },
+            )
+
+            respuesta = _respuesta_pregunta_tecnica_unica(
+                preguntas_limpias[0],
+                primera=True,
+            )
+
+            return (
+                _marcar_respuesta_segura(respuesta),
+                "descubrimiento",
+                necesidad_ctx,
+            )
+
+        # Si no hay preguntas técnicas, pedimos confirmación del relacionado.
+        respuesta = respuesta_producto_relacionado(
             producto=producto,
             razon=res.get("razon"),
             pregunta_sugerida=res.get("pregunta_sugerida"),
             cliente=cliente,
         )
 
-        preguntas_limpias = [
-            p.strip()
-            for p in preguntas_tecnicas
-            if isinstance(p, str) and p.strip()
-        ][:3]
-
-        if preguntas_limpias:
-            bloque_preguntas = "\n".join(
-                f"{i + 1}. {pregunta}"
-                for i, pregunta in enumerate(preguntas_limpias)
-            )
-
-            respuesta = (
-                f"{respuesta_base}\n\n"
-                "Para validar mejor la solución, necesito confirmar:\n"
-                f"{bloque_preguntas}"
-            )
-        else:
-            respuesta = respuesta_base
-
         necesidad_ctx = {
             **necesidad_ctx_base,
             "producto_relacionado": producto,
             "pregunta_sugerida": res.get("pregunta_sugerida"),
             "razon": res.get("razon"),
-            "preguntas_tecnicas": preguntas_limpias,
         }
 
         return (
@@ -1292,20 +1402,64 @@ def construir_respuesta_desde_resultado(
             necesidad_ctx,
         )
 
+    # ------------------------------------------------------------
+    # 3) Pendiente: necesita preguntas técnicas
+    # ------------------------------------------------------------
     if estado == "pendiente":
-        preguntas = res.get("preguntas", [])
-        texto_preguntas = "\n".join(f"{i + 1}. {p}" for i, p in enumerate(preguntas))
+        preguntas = _limpiar_preguntas_tecnicas(res.get("preguntas", []))
+
+        if preguntas:
+            texto_original = (
+                necesidad_ctx_base.get("texto_original")
+                or necesidad_ctx_base.get("query_evaluada")
+                or ""
+            )
+
+            necesidad_ctx = _crear_ctx_preguntas_secuenciales(
+                texto_original=texto_original,
+                preguntas=preguntas,
+                necesidad_ctx_base=necesidad_ctx_base,
+            )
+
+            return (
+                _marcar_respuesta_segura(
+                    _respuesta_pregunta_tecnica_unica(
+                        preguntas[0],
+                        primera=True,
+                    )
+                ),
+                "descubrimiento",
+                necesidad_ctx,
+            )
 
         return (
-            f"[PENDIENTE — NECESITA MÁS INFORMACIÓN]\n{texto_preguntas}",
+            _marcar_respuesta_segura(
+                "Necesito un poco más de información para buscar la opción adecuada. "
+                "¿Puedes indicarme la aplicación o especificación principal?"
+            ),
             "descubrimiento",
             necesidad_ctx_base,
         )
 
+    # ------------------------------------------------------------
+    # 4) Fallback defensivo final
+    # ------------------------------------------------------------
+    # Puede llegar aquí cuando buscar_en_catalogo() retorna estados como:
+    # - sin_resultado
+    # - no_compatible
+    # - sin_match
+    # - cualquier estado futuro no contemplado
+    #
+    # En todos esos casos, NIA debe pedir más información sin romper el turno.
+    pregunta_fallback = (
+        res.get("pregunta_sugerida")
+        or "¿Puedes indicarme una referencia, aplicación exacta o especificación técnica adicional?"
+    )
+
     return (
         _marcar_respuesta_segura(
             respuesta_sin_resultado(
-                pregunta_sugerida=res.get("pregunta_sugerida"),
+                pregunta_sugerida=pregunta_fallback,
                 cliente=cliente,
             )
         ),
@@ -2576,6 +2730,81 @@ async def procesar_turno(
                     },
                 )
 
+        # Caso 3A: preguntas técnicas secuenciales
+        # NIA tiene hasta 3 preguntas guardadas, pero solo muestra una por turno.
+        elif etapa == "descubrimiento" and necesidad_ctx.get("preguntas_tecnicas"):
+            preguntas = _limpiar_preguntas_tecnicas(
+                necesidad_ctx.get("preguntas_tecnicas", [])
+            )
+
+            texto_original = (
+                necesidad_ctx.get("texto_original")
+                or necesidad_ctx.get("query_evaluada")
+                or ""
+            )
+
+            try:
+                pregunta_actual_idx = int(necesidad_ctx.get("pregunta_actual_idx", 0))
+            except (TypeError, ValueError):
+                pregunta_actual_idx = 0
+
+            respuestas_tecnicas = necesidad_ctx.get("respuestas_tecnicas", [])
+
+            if not isinstance(respuestas_tecnicas, list):
+                respuestas_tecnicas = []
+
+            respuestas_tecnicas = [
+                str(r).strip()
+                for r in respuestas_tecnicas
+                if str(r).strip()
+            ]
+
+            if mensaje.strip():
+                respuestas_tecnicas.append(mensaje.strip())
+
+            siguiente_idx = pregunta_actual_idx + 1
+
+            if preguntas and siguiente_idx < len(preguntas):
+                contexto_extra = _marcar_respuesta_segura(
+                    _respuesta_pregunta_tecnica_unica(
+                        preguntas[siguiente_idx],
+                        primera=False,
+                    )
+                )
+
+                nueva_etapa = "descubrimiento"
+                necesidad_ctx = {
+                    **necesidad_ctx,
+                    "texto_original": texto_original,
+                    "preguntas_tecnicas": preguntas,
+                    "pregunta_actual_idx": siguiente_idx,
+                    "respuestas_tecnicas": respuestas_tecnicas,
+                }
+
+            else:
+                # Ya respondieron las preguntas disponibles.
+                # Construimos una búsqueda enriquecida con la necesidad original
+                # y las respuestas técnicas del cliente.
+                query_e = " ".join(
+                    [texto_original] + respuestas_tecnicas
+                ).strip()
+
+                res = await buscar_en_catalogo(query_e)
+
+                if debe_intentar_enriquecimiento(res):
+                    res = await enriquecer_y_buscar(query_e)
+
+                contexto_extra, nueva_etapa, necesidad_ctx = construir_respuesta_desde_resultado(
+                    res=res,
+                    cliente=cliente,
+                    productos_acumulados=productos_acumulados,
+                    desde="descubrimiento_secuencial",
+                    necesidad_ctx_base={
+                        "texto_original": texto_original,
+                        "query_evaluada": query_e,
+                    },
+                )
+                
         # Caso 3: respuesta a preguntas de descubrimiento
         elif etapa == "descubrimiento" and necesidad_ctx.get("texto_original"):
             query_e = f"{necesidad_ctx['texto_original']} {mensaje}".strip()
@@ -2600,12 +2829,34 @@ async def procesar_turno(
                 )
 
             else:
-                preguntas = nec["preguntas"]
-                contexto_extra = "[NECESIDAD AÚN NO CLARA]\n" + "\n".join(
-                    f"{i + 1}. {p}" for i, p in enumerate(preguntas)
-                )
+                preguntas = _limpiar_preguntas_tecnicas(nec.get("preguntas", []))
+
+                if preguntas:
+                    texto_original = necesidad_ctx.get("texto_original")
+                    necesidad_ctx = _crear_ctx_preguntas_secuenciales(
+                        texto_original=texto_original,
+                        preguntas=preguntas,
+                        necesidad_ctx_base={
+                            "texto_original": texto_original,
+                        },
+                    )
+
+                    contexto_extra = _marcar_respuesta_segura(
+                        _respuesta_pregunta_tecnica_unica(
+                            preguntas[0],
+                            primera=True,
+                        )
+                    )
+                else:
+                    contexto_extra = _marcar_respuesta_segura(
+                        "Necesito un poco más de información para buscar la opción adecuada. "
+                        "¿Puedes indicarme la aplicación o especificación principal?"
+                    )
+                    necesidad_ctx = {
+                        "texto_original": necesidad_ctx.get("texto_original")
+                    }
+
                 nueva_etapa = "descubrimiento"
-                necesidad_ctx = {"texto_original": necesidad_ctx.get("texto_original")}
 
         # Caso 4: solo saludo
         elif es_solo_saludo(mensaje):
@@ -2654,13 +2905,32 @@ async def procesar_turno(
                     )
 
                 else:
-                    preguntas = nec["preguntas"]
-                    contexto_extra = (
-                        f"[NECESIDAD NO CLARA — dominio: {nec['dominio']}]\n"
-                        + "\n".join(f"{i + 1}. {p}" for i, p in enumerate(preguntas))
-                    )
+                    preguntas = _limpiar_preguntas_tecnicas(nec.get("preguntas", []))
+
+                    if preguntas:
+                        necesidad_ctx = _crear_ctx_preguntas_secuenciales(
+                            texto_original=mensaje,
+                            preguntas=preguntas,
+                            necesidad_ctx_base={
+                                "texto_original": mensaje,
+                                "dominio": nec.get("dominio"),
+                            },
+                        )
+
+                        contexto_extra = _marcar_respuesta_segura(
+                            _respuesta_pregunta_tecnica_unica(
+                                preguntas[0],
+                                primera=True,
+                            )
+                        )
+                    else:
+                        contexto_extra = _marcar_respuesta_segura(
+                            "Necesito un poco más de información para buscar la opción adecuada. "
+                            "¿Puedes indicarme la aplicación o especificación principal?"
+                        )
+                        necesidad_ctx = {"texto_original": mensaje}
+
                     nueva_etapa = "descubrimiento"
-                    necesidad_ctx = {"texto_original": mensaje}
 
        
         # Intenciones comerciales transversales
