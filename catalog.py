@@ -1083,6 +1083,579 @@ def _disponibilidad_catalogo(p: dict) -> str:
 
     return "Disponibilidad: a confirmar con asesor"
 
+# ============================================================
+# DETECCIÓN GENERAL DE TIPOS POR TAXONOMÍA DE CATÁLOGO
+# ============================================================
+
+CAMPOS_TAXONOMIA_PRODUCTO = [
+    "nivel_0",
+    "nivel_1",
+    "nivel_2",
+    "nivel_3",
+    "nivel_4",
+    "categoria",
+]
+
+
+CAMPOS_TAXONOMIA_PRIORIDAD = [
+    # Primero intentamos niveles más generales y estables.
+    "nivel_0",
+    "nivel_1",
+    "nivel_2",
+    # Luego niveles más específicos.
+    "nivel_3",
+    "nivel_4",
+    "categoria",
+]
+
+
+PALABRAS_FUNCIONALES_TAXONOMIA = {
+    "de",
+    "del",
+    "la",
+    "el",
+    "los",
+    "las",
+    "un",
+    "una",
+    "uno",
+    "unos",
+    "unas",
+    "para",
+    "por",
+    "con",
+    "sin",
+    "en",
+    "y",
+    "o",
+    "a",
+}
+
+
+def _normalizar_taxonomia_texto(valor: str) -> str:
+    """
+    Normaliza texto de taxonomía para comparación.
+
+    Importante:
+    - No se usa para mostrar al cliente.
+    - Solo sirve para comparar, filtrar y agrupar.
+    """
+    if not valor:
+        return ""
+
+    texto = str(valor).lower().strip()
+
+    reemplazos = {
+        "á": "a",
+        "é": "e",
+        "í": "i",
+        "ó": "o",
+        "ú": "u",
+        "ü": "u",
+        "ñ": "n",
+    }
+
+    for origen, destino in reemplazos.items():
+        texto = texto.replace(origen, destino)
+
+    texto = texto.replace("-", " ")
+    texto = re.sub(r"[^a-z0-9\s]", " ", texto)
+    texto = re.sub(r"\s+", " ", texto).strip()
+
+    return texto
+
+
+def _singular_taxonomia(token: str) -> str:
+    """
+    Singularización básica para comparar familias:
+    - valvulas -> valvula
+    - termometros -> termometro
+    - transmisores -> transmisor
+
+    No pretende ser lingüística perfecta.
+    Solo reduce variaciones comunes del catálogo.
+    """
+    token = (token or "").strip().lower()
+
+    if len(token) > 5 and token.endswith("es"):
+        return token[:-2]
+
+    if len(token) > 4 and token.endswith("s"):
+        return token[:-1]
+
+    return token
+
+
+def _tokens_taxonomia(valor: str) -> list[str]:
+    """
+    Extrae tokens útiles desde texto de taxonomía.
+    No toma tokens desde descripción comercial libre.
+    """
+    texto = _normalizar_taxonomia_texto(valor)
+
+    tokens = []
+
+    for token in texto.split():
+        token = _singular_taxonomia(token)
+
+        if len(token) < 4:
+            continue
+
+        if token.isdigit():
+            continue
+
+        if token in PALABRAS_FUNCIONALES_TAXONOMIA:
+            continue
+
+        tokens.append(token)
+
+    return tokens
+
+
+def _valor_campo_producto(producto: dict, campo: str):
+    """
+    Obtiene un campo de producto tolerando variaciones de mayúsculas/minúsculas.
+    """
+    if not isinstance(producto, dict):
+        return None
+
+    return (
+        producto.get(campo)
+        or producto.get(campo.upper())
+        or producto.get(campo.lower())
+    )
+
+
+def _texto_taxonomico_producto(producto: dict) -> str:
+    """
+    Construye un texto solo con campos taxonómicos del producto.
+    No usa nombre ni descripción para decidir tipos.
+    """
+    partes = []
+
+    for campo in CAMPOS_TAXONOMIA_PRODUCTO:
+        valor = _valor_campo_producto(producto, campo)
+        if valor:
+            partes.append(str(valor))
+
+    return " ".join(partes)
+
+
+def _producto_relacionado_con_familia(
+    producto: dict,
+    texto_cliente: str,
+) -> bool:
+    """
+    Determina si un producto pertenece realmente a la familia consultada.
+
+    Regla general:
+    - No basta con que la palabra del cliente aparezca en cualquier parte.
+    - La familia consultada debe aparecer al inicio de una rama taxonómica.
+    - Esto evita aceptar productos como:
+      "Transmisores controladores de válvulas" cuando el cliente pidió "válvula".
+      "Switches de presión para bombas" cuando el cliente pidió "bomba".
+
+    Esta lógica no es por producto específico; depende de la estructura
+    jerárquica del catálogo.
+    """
+    tokens_cliente = [
+        _singular_taxonomia(token)
+        for token in _tokens_taxonomia(texto_cliente)
+    ]
+
+    if not tokens_cliente:
+        return False
+
+    # Para consultas cortas como "valvula", "termometro", "bomba",
+    # usamos el primer token como familia principal.
+    familia_principal = tokens_cliente[0]
+
+    campos_prioritarios = [
+        "nivel_0",
+        "nivel_1",
+        "nivel_2",
+        "nivel_3",
+        "nivel_4",
+        "categoria",
+    ]
+
+    for campo in campos_prioritarios:
+        valor = _valor_campo_producto(producto, campo)
+
+        if not valor:
+            continue
+
+        texto_norm = _normalizar_taxonomia_texto(str(valor))
+        tokens_valor = [
+            _singular_taxonomia(token)
+            for token in texto_norm.split()
+            if token.strip()
+        ]
+
+        if not tokens_valor:
+            continue
+
+        primer_token = tokens_valor[0]
+
+        if primer_token == familia_principal:
+            return True
+
+        if texto_norm.startswith(familia_principal + " "):
+            return True
+
+    return False
+
+
+def _filtrar_productos_por_familia(
+    texto_cliente: str,
+    productos: list[dict],
+) -> list[dict]:
+    """
+    Filtra candidatos para quedarse con productos cuya taxonomía sí pertenece
+    a la familia escrita por el cliente.
+    """
+    if not productos:
+        return []
+
+    filtrados = [
+        producto
+        for producto in productos
+        if _producto_relacionado_con_familia(producto, texto_cliente)
+    ]
+
+    return filtrados
+
+
+def _limpiar_valor_taxonomico(valor: str) -> str:
+    """
+    Limpia un valor de taxonomía para mostrarlo como opción al cliente.
+    """
+    if not valor:
+        return ""
+
+    texto = str(valor).strip()
+    texto = re.sub(r"\s+", " ", texto).strip()
+
+    return texto
+
+
+def _valor_taxonomico_producto(producto: dict, campo: str) -> str:
+    """
+    Devuelve un valor taxonómico limpio de un producto.
+    """
+    valor = _valor_campo_producto(producto, campo)
+
+    if not valor:
+        return ""
+
+    return _limpiar_valor_taxonomico(str(valor))
+
+
+def _resumir_opcion_taxonomica(
+    texto_cliente: str,
+    valor_taxonomico: str,
+) -> str:
+    """
+    Convierte una ruta taxonómica en una opción más limpia para el cliente.
+
+    Ejemplo:
+    - texto_cliente: "termometro"
+    - valor_taxonomico: "Termometros digitales portatiles de bolsillo"
+    - salida: "digitales portátiles de bolsillo"
+
+    No inventa. Solo remueve la familia principal ya escrita por el cliente.
+    """
+    valor_original = _limpiar_valor_taxonomico(valor_taxonomico)
+
+    if not valor_original:
+        return ""
+
+    texto_norm = _normalizar_taxonomia_texto(valor_original)
+
+    tokens_cliente = {
+        _singular_taxonomia(token)
+        for token in _tokens_taxonomia(texto_cliente)
+    }
+
+    tokens_salida = []
+
+    for token in texto_norm.split():
+        token_base = _singular_taxonomia(token)
+
+        if token_base in PALABRAS_FUNCIONALES_TAXONOMIA:
+            continue
+
+        # Removemos la familia principal escrita por el cliente.
+        # Ejemplo: "termometros" cuando el cliente escribió "termometro".
+        if token_base in tokens_cliente:
+            continue
+
+        tokens_salida.append(token)
+
+    if not tokens_salida:
+        return valor_original
+
+    opcion = " ".join(tokens_salida)
+    opcion = re.sub(r"\s+", " ", opcion).strip()
+
+    return opcion
+
+def _opcion_taxonomica_especificacion_tecnica(etiqueta: str) -> bool:
+    """
+    Detecta si una opción taxonómica parece una especificación técnica
+    y no un tipo/familia de producto.
+
+    Regla general:
+    - Si tiene números, unidades, voltajes, tamaños, capacidades o señales,
+      no debe usarse como "tipo de producto".
+    - Esos datos pueden preguntarse después como campos técnicos,
+      pero no como primera pregunta de tipo.
+    """
+    texto = _normalizar_taxonomia_texto(etiqueta)
+
+    if not texto:
+        return True
+
+    # Si contiene cualquier número, probablemente ya es una especificación:
+    # voltaje, tamaño, capacidad, rango, dimensión, número de vías, etc.
+    if any(char.isdigit() for char in texto):
+        return True
+
+    unidades_o_specs = {
+        "vac",
+        "vdc",
+        "volt",
+        "volts",
+        "voltaje",
+        "amp",
+        "amps",
+        "ma",
+        "mv",
+        "w",
+        "kw",
+        "hz",
+        "cfm",
+        "gpm",
+        "lpm",
+        "psi",
+        "bar",
+        "mbar",
+        "pa",
+        "kpa",
+        "mpa",
+        "mm",
+        "cm",
+        "pulgada",
+        "pulgadas",
+        "inch",
+        "inches",
+        "dial",
+        "rango",
+        "escala",
+        "diametro",
+        "diametro",
+        "rosca",
+        "npt",
+        "bsp",
+        "salida",
+        "entrada",
+        "senal",
+        "señal",
+        "rele",
+        "relay",
+        "contacto",
+        "contactos",
+    }
+
+    tokens = set(texto.split())
+
+    return bool(tokens & unidades_o_specs)
+
+def _agrupar_por_campo_taxonomico(
+    texto_cliente: str,
+    productos: list[dict],
+    campo: str,
+) -> list[dict]:
+    """
+    Agrupa productos por un campo taxonómico.
+
+    Retorna grupos con:
+    - etiqueta: opción resumida para mostrar.
+    - valor_original: valor real del catálogo.
+    - campo: campo usado para agrupar.
+    - cantidad: cantidad de productos en el grupo.
+
+    Regla importante:
+    - No usa como tipo opciones que ya parecen especificaciones técnicas.
+    """
+    grupos: dict[str, dict] = {}
+
+    for producto in productos:
+        valor = _valor_taxonomico_producto(producto, campo)
+
+        if not valor:
+            continue
+
+        etiqueta = _resumir_opcion_taxonomica(
+            texto_cliente=texto_cliente,
+            valor_taxonomico=valor,
+        )
+
+        if not etiqueta:
+            continue
+
+        # Evitamos que voltajes, dimensiones, capacidades o señales
+        # se presenten como "tipo de producto".
+        if _opcion_taxonomica_especificacion_tecnica(etiqueta):
+            continue
+
+        clave = _normalizar_taxonomia_texto(etiqueta)
+
+        if not clave:
+            continue
+
+        if clave not in grupos:
+            grupos[clave] = {
+                "etiqueta": etiqueta,
+                "valor_original": valor,
+                "campo": campo,
+                "cantidad": 0,
+            }
+
+        grupos[clave]["cantidad"] += 1
+
+    return sorted(
+        grupos.values(),
+        key=lambda item: (-item["cantidad"], item["etiqueta"]),
+    )
+
+
+def _nivel_taxonomico_util(
+    texto_cliente: str,
+    productos: list[dict],
+) -> tuple[Optional[str], list[dict]]:
+    """
+    Elige automáticamente el mejor nivel taxonómico para preguntar por tipo.
+
+    Criterios:
+    - Debe generar entre 2 y 5 opciones.
+    - Las opciones deben cubrir una parte relevante de los productos filtrados.
+    - Se prefieren niveles generales antes que niveles demasiado específicos.
+    """
+    if not productos:
+        return None, []
+
+    total = len(productos)
+
+    mejor_campo = None
+    mejores_grupos: list[dict] = []
+
+    for campo in CAMPOS_TAXONOMIA_PRIORIDAD:
+        grupos = _agrupar_por_campo_taxonomico(
+            texto_cliente=texto_cliente,
+            productos=productos,
+            campo=campo,
+        )
+
+        if len(grupos) < 2:
+            continue
+
+        # Evitamos listas demasiado largas. Si hay más de 5 grupos,
+        # tomamos los 5 más representativos, pero verificamos cobertura.
+        grupos_top = grupos[:5]
+
+        cobertura = sum(g["cantidad"] for g in grupos_top) / max(total, 1)
+
+        if cobertura < 0.45:
+            continue
+
+        mejor_campo = campo
+        mejores_grupos = grupos_top
+        break
+
+    return mejor_campo, mejores_grupos
+
+
+def detectar_tipos_producto(
+    texto_cliente: str,
+    productos: list[dict],
+    max_tipos: int = 5,
+) -> list[str]:
+    """
+    Detecta tipos/variantes usando taxonomía real del catálogo.
+
+    Garantías:
+    - No usa nombre ni descripción libre.
+    - No inventa tipos.
+    - No usa reglas por producto específico.
+    - Si la taxonomía no es clara, devuelve [].
+    """
+    productos_filtrados = _filtrar_productos_por_familia(
+        texto_cliente=texto_cliente,
+        productos=productos,
+    )
+
+    # Si no hay suficientes productos realmente relacionados,
+    # no forzamos pregunta por tipo.
+    if len(productos_filtrados) < 3:
+        return []
+
+    _, grupos = _nivel_taxonomico_util(
+        texto_cliente=texto_cliente,
+        productos=productos_filtrados,
+    )
+
+    if not grupos:
+        return []
+
+    tipos = [g["etiqueta"] for g in grupos[:max_tipos]]
+
+    # Evitamos opciones duplicadas normalizadas.
+    vistos = set()
+    tipos_limpios = []
+
+    for tipo in tipos:
+        clave = _normalizar_taxonomia_texto(tipo)
+
+        if not clave or clave in vistos:
+            continue
+
+        vistos.add(clave)
+        tipos_limpios.append(tipo)
+
+    return tipos_limpios
+
+
+def debe_preguntar_tipo_producto(
+    texto_cliente: str,
+    productos: list[dict],
+) -> tuple[bool, list[str]]:
+    """
+    Decide si conviene preguntar por tipo de producto antes de seguir.
+
+    Solo activa el flujo si:
+    - La consulta es corta/genérica.
+    - Hay candidatos realmente relacionados con la familia.
+    - La taxonomía genera entre 2 y 5 opciones claras.
+    """
+    if not productos or len(productos) < 6:
+        return False, []
+
+    tokens_cliente = _tokens_taxonomia(texto_cliente)
+
+    # Si el cliente ya dio muchos detalles técnicos, no frenamos con tipo.
+    if len(tokens_cliente) >= 4:
+        return False, []
+
+    tipos = detectar_tipos_producto(
+        texto_cliente=texto_cliente,
+        productos=productos,
+    )
+
+    if 2 <= len(tipos) <= 5:
+        return True, tipos
+
+    return False, tipos
 
 def formatear_producto(p: dict) -> str:
     """
