@@ -49,11 +49,19 @@ from catalog import (
     evaluar_coincidencia,
     formatear_producto,
     debe_preguntar_tipo_producto,
+    extraer_campos_query,
+    score_campos_producto,
+    filtrar_candidatos_coherentes,
+    campos_disponibles_de,
+    ordenar_campos_por_prioridad,
 )
 from product_matcher import validar_compatibilidad_producto
 from file_processor import procesar_archivo
 from knowledge import contexto_para_agente
-from questions_agent import generar_preguntas
+from questions_agent import (
+    generar_preguntas,
+    generar_preguntas_campos_dinamicos,
+)
 from response_engine import (
     respuesta_producto_encontrado,
     respuesta_producto_relacionado,
@@ -946,7 +954,66 @@ async def buscar_en_catalogo(texto: str) -> dict:
     """
     logger.info("Búsqueda catálogo solicitada: '%s'", texto[:100])
 
-    queries_catalogo = await generar_queries_catalogo(texto)
+    # ------------------------------------------------------------
+    # Campos técnicos declarados en el mensaje original
+    # ------------------------------------------------------------
+    # El texto original es la fuente de verdad técnica.
+    #
+    # El normalizador LLM puede generar consultas más cortas para
+    # retrieval, pero no puede eliminar campos como:
+    # - entrada
+    # - salida
+    # - rango
+    # - dimensiones
+    # - conexión
+    campos_originales = extraer_campos_query(texto)
+
+    campos_originales_significativos = {
+        nombre: valor
+        for nombre, valor in (campos_originales or {}).items()
+        if (
+            nombre != "valor_tecnico"
+            and str(valor or "").strip()
+        )
+    }
+
+    queries_generadas = await generar_queries_catalogo(texto)
+
+    # ------------------------------------------------------------
+    # Orden de consultas
+    # ------------------------------------------------------------
+    # Cuando el cliente ya declaró dos o más campos técnicos,
+    # probamos primero el mensaje original.
+    queries_catalogo = []
+
+    if len(campos_originales_significativos) >= 2:
+        texto_original_limpio = str(texto or "").strip()
+
+        if texto_original_limpio:
+            queries_catalogo.append(
+                texto_original_limpio
+            )
+
+    for query_generada in queries_generadas or []:
+        query_generada = str(
+            query_generada or ""
+        ).strip()
+
+        if not query_generada:
+            continue
+
+        if query_generada in queries_catalogo:
+            continue
+
+        queries_catalogo.append(
+            query_generada
+        )
+
+    logger.info(
+        "Queries catálogo ordenadas: originales=%s queries=%s",
+        campos_originales_significativos,
+        queries_catalogo,
+    )
 
     if not queries_catalogo:
         return {
@@ -968,9 +1035,21 @@ async def buscar_en_catalogo(texto: str) -> dict:
         # - Extrae campos técnicos si existen.
         # - Consulta MongoDB como fuente oficial.
         # - NO decide compatibilidad final.
-        resultados, campos_query = await buscar_con_campos(query)
+        resultados_intento, campos_detectados_intento = (
+            await buscar_con_campos(query)
+        )
 
-        if resultados:
+        if resultados_intento:
+            resultados = resultados_intento
+
+            # Los campos detectados en la consulta utilizada ayudan
+            # al retrieval, pero los campos del mensaje original
+            # tienen prioridad semántica.
+            campos_query = {
+                **(campos_detectados_intento or {}),
+                **campos_originales_significativos,
+            }
+
             query_usada = query
             logger.info(
                 "Catálogo devolvió %s candidatos usando query='%s' campos_query=%s",
@@ -1003,6 +1082,86 @@ async def buscar_en_catalogo(texto: str) -> dict:
             query_usada,
         )
 
+    # ------------------------------------------------------------
+    # Guardrail determinístico de compatibilidad estructurada
+    # ------------------------------------------------------------
+    # El mensaje original es la fuente de verdad técnica.
+    #
+    # Si el cliente declaró dos o más campos, el scorer determinístico
+    # encontró un candidato válido y ese candidato cumple prácticamente
+    # todos los campos, no permitimos que el LLM lo sustituya por un
+    # producto técnicamente inferior.
+    #
+    # Ejemplo validado:
+    # - solicitado: rango -50 a 200 °C
+    # - solicitado: sonda 150 mm x 4 mm
+    # - 130617: cumple ambos campos
+    # - 130620: cumple rango, pero la sonda mide 63,5 mm
+    cantidad_campos_originales = len(
+        campos_originales_significativos
+    )
+
+    score_estructurado_determinista = 0.0
+
+    if (
+        ok_textual
+        and prod_textual
+        and cantidad_campos_originales >= 2
+    ):
+        score_estructurado_determinista = (
+            score_campos_producto(
+                producto=prod_textual,
+                campos_query=campos_query,
+            )
+        )
+
+        logger.info(
+            "Guardrail técnico determinístico: codigo=%s "
+            "score_textual=%s score_estructurado=%s campos=%s",
+            prod_textual.get("codigo"),
+            prod_textual.get("_score"),
+            score_estructurado_determinista,
+            campos_query,
+        )
+
+    if (
+        ok_textual
+        and prod_textual
+        and cantidad_campos_originales >= 2
+        and score_estructurado_determinista >= 0.90
+    ):
+        razon_determinista = (
+            "El producto coincide con la familia solicitada y cumple "
+            "los campos técnicos estructurados declarados por el cliente."
+        )
+
+        prod_textual["_compatibilidad"] = {
+            "estado": "exact_match",
+            "confianza": score_estructurado_determinista,
+            "razon": razon_determinista,
+            "query_catalogo": query_usada,
+            "origen": "guardrail_deterministico",
+        }
+
+        logger.info(
+            "Candidato determinístico aprobado antes del product_matcher: "
+            "codigo=%s score_estructurado=%s",
+            prod_textual.get("codigo"),
+            score_estructurado_determinista,
+        )
+
+        return {
+            "estado": "encontrado",
+            "producto": prod_textual,
+            "tipo": "compatibilidad_estructurada",
+            "exacto": True,
+            "razon": razon_determinista,
+            "query_catalogo": query_usada,
+            "candidatos_encontrados": True,
+        }
+
+    # Si el candidato determinístico no alcanza la evidencia requerida,
+    # conservamos el product_matcher como segunda capa de validación.
     decision = await validar_compatibilidad_producto(
         necesidad_cliente=texto,
         candidatos=resultados,
@@ -1432,9 +1591,20 @@ def construir_respuesta_desde_resultado(
             res.get("preguntas_tecnicas") or []
         )
 
-        # Si hay preguntas técnicas, no las mandamos todas juntas.
-        # Guardamos la lista completa y mostramos solo la primera.
-        if preguntas_limpias:
+        diagnostico_tecnico_completo = bool(
+            necesidad_ctx_base.get(
+                "diagnostico_tecnico_completo",
+                False,
+            )
+        )
+
+        # Si ya se completó el máximo de preguntas técnicas,
+        # no se permite iniciar una lista nueva.
+        #
+        # En ese caso el flujo continúa hacia validando_relacionado,
+        # mostrando el candidato real y pidiendo una confirmación,
+        # pero sin hacer una cuarta pregunta técnica.
+        if preguntas_limpias and not diagnostico_tecnico_completo:
             texto_original = (
                 necesidad_ctx_base.get("texto_original")
                 or necesidad_ctx_base.get("query_evaluada")
@@ -2812,12 +2982,32 @@ async def procesar_turno(
                     },
                 )
 
-        # Caso 2B: respuesta a pregunta por tipo de producto
-        # Este flujo se activa cuando el catálogo detectó varias ramas reales
-        # para una familia genérica. Ejemplo:
-        # - termometro -> digitales portatiles bolsillo / punzon
-        # - transmisor -> temperatura / senales
-        elif etapa == "esperando_tipo_producto" and necesidad_ctx.get("tipos_detectados"):
+                # Caso 2B: respuesta a pregunta por tipo de producto
+        # ------------------------------------------------------------
+        # Flujo Grupo C:
+        #
+        # 1. El cliente ya indicó la familia genérica.
+        # 2. NIA mostró tipos reales del catálogo.
+        # 3. El cliente acaba de confirmar un tipo.
+        # 4. Antes de presentar un SKU, analizamos los campos técnicos
+        #    reales de los candidatos coherentes.
+        # 5. Se seleccionan máximo dos campos discriminantes.
+        # 6. Se pregunta uno por turno.
+        #
+        # Máximo total:
+        # - pregunta de tipo;
+        # - campo técnico 1;
+        # - campo técnico 2.
+        # ------------------------------------------------------------
+        elif (
+            etapa == "esperando_tipo_producto"
+            and necesidad_ctx.get("tipos_detectados")
+        ):
+            tipos_detectados_previos = necesidad_ctx.get(
+                "tipos_detectados",
+                [],
+            )
+
             texto_original = (
                 necesidad_ctx.get("texto_original")
                 or necesidad_ctx.get("query_evaluada")
@@ -2825,89 +3015,190 @@ async def procesar_turno(
             )
 
             tipo_confirmado = mensaje.strip()
-            query_e = f"{texto_original} {tipo_confirmado}".strip()
 
-            res = await buscar_en_catalogo(query_e)
+            query_tipo = " ".join(
+                parte
+                for parte in [
+                    texto_original,
+                    tipo_confirmado,
+                ]
+                if str(parte or "").strip()
+            ).strip()
 
-            if debe_intentar_enriquecimiento(res):
-                res = await enriquecer_y_buscar(query_e)
+            productos_candidatos = []
+            productos_coherentes = []
+            campos_disponibles = []
+            campos_seleccionados = []
+            preguntas_dinamicas = []
 
-            # ------------------------------------------------------------
-            # Si con el tipo confirmado encontramos SKU exacto, respondemos
-            # con producto real del catálogo.
-            # ------------------------------------------------------------
-            if res.get("estado") == "encontrado" and res.get("producto"):
-                contexto_extra, nueva_etapa, necesidad_ctx = construir_respuesta_desde_resultado(
-                    res=res,
-                    cliente=cliente,
-                    productos_acumulados=productos_acumulados,
-                    desde="tipo_producto",
+            try:
+                # ----------------------------------------------------
+                # 1. Recuperar candidatos del tipo elegido
+                # ----------------------------------------------------
+                productos_candidatos = (
+                    await buscar_por_texto(query_tipo)
+                    or []
+                )
+
+                # ----------------------------------------------------
+                # 2. Eliminar productos de familias no coherentes
+                # ----------------------------------------------------
+                productos_coherentes = filtrar_candidatos_coherentes(
+                    texto_cliente=query_tipo,
+                    productos=productos_candidatos,
+                )
+
+                # Fallback defensivo:
+                # si el filtro fue demasiado restrictivo, conservamos
+                # los candidatos reales de la búsqueda, pero nunca
+                # inventamos productos.
+                if not productos_coherentes:
+                    productos_coherentes = productos_candidatos
+
+                # ----------------------------------------------------
+                # 3. Analizar campos técnicos reales
+                # ----------------------------------------------------
+                campos_disponibles = campos_disponibles_de(
+                    productos=productos_coherentes,
+                    min_cobertura=0.10,
+                    min_valores_distintos=2,
+                    max_campos=10,
+                )
+
+                # ----------------------------------------------------
+                # 4. Seleccionar máximo dos campos discriminantes
+                # ----------------------------------------------------
+                campos_seleccionados = ordenar_campos_por_prioridad(
+                    campos_disponibles=campos_disponibles,
+                    max_campos=2,
+                )
+
+                # ----------------------------------------------------
+                # 5. Convertir los campos en preguntas naturales
+                # ----------------------------------------------------
+                preguntas_dinamicas = (
+                    generar_preguntas_campos_dinamicos(
+                        texto_producto=query_tipo,
+                        campos_seleccionados=campos_seleccionados,
+                        max_preguntas=2,
+                    )
+                )
+
+                preguntas_dinamicas = _limpiar_preguntas_tecnicas(
+                    preguntas_dinamicas
+                )
+
+                logger.info(
+                    "Flujo campos dinámicos: query='%s' "
+                    "candidatos=%s coherentes=%s campos=%s preguntas=%s",
+                    query_tipo,
+                    len(productos_candidatos),
+                    len(productos_coherentes),
+                    [
+                        campo.get("campo")
+                        for campo in campos_seleccionados
+                        if isinstance(campo, dict)
+                    ],
+                    len(preguntas_dinamicas),
+                )
+
+            except Exception as e:
+                logger.exception(
+                    "Error construyendo campos dinámicos "
+                    "después de confirmar tipo: %s",
+                    e,
+                )
+
+                productos_candidatos = []
+                productos_coherentes = []
+                campos_disponibles = []
+                campos_seleccionados = []
+                preguntas_dinamicas = []
+
+            # --------------------------------------------------------
+            # Si existen campos reales, iniciamos preguntas secuenciales
+            # --------------------------------------------------------
+            if preguntas_dinamicas:
+                # Guardamos solo un resumen liviano de los campos.
+                # No guardamos los productos completos en la sesión.
+                campos_ctx = []
+
+                for campo in campos_seleccionados:
+                    if not isinstance(campo, dict):
+                        continue
+
+                    campos_ctx.append(
+                        {
+                            "campo": campo.get("campo"),
+                            "familia_semantica": campo.get(
+                                "familia_semantica"
+                            ),
+                            "score": campo.get("score"),
+                            "cobertura": campo.get("cobertura"),
+                        }
+                    )
+
+                necesidad_ctx = _crear_ctx_preguntas_secuenciales(
+                    texto_original=query_tipo,
+                    preguntas=preguntas_dinamicas,
                     necesidad_ctx_base={
-                        "texto_original": texto_original,
-                        "query_evaluada": query_e,
-                        "tipos_detectados": necesidad_ctx.get("tipos_detectados", []),
+                        "texto_original": query_tipo,
+                        "query_evaluada": query_tipo,
+                        "texto_producto_base": texto_original,
+                        "tipos_detectados": tipos_detectados_previos,
                         "tipo_confirmado": tipo_confirmado,
+
+                        # Identifica que estas preguntas provienen
+                        # de campos reales del catálogo.
+                        "flujo_campos_dinamicos": True,
+                        "campos_tecnicos_seleccionados": campos_ctx,
+
+                        # Métricas útiles para logs y auditoría.
+                        "cantidad_candidatos": len(
+                            productos_candidatos
+                        ),
+                        "cantidad_coherentes": len(
+                            productos_coherentes
+                        ),
                     },
                 )
 
+                contexto_extra = _marcar_respuesta_segura(
+                    _respuesta_pregunta_tecnica_unica(
+                        preguntas_dinamicas[0],
+                        primera=True,
+                    )
+                )
+
+                nueva_etapa = "descubrimiento"
+
+            # --------------------------------------------------------
+            # Si el catálogo no tiene campos estructurados suficientes,
+            # no inventamos preguntas: buscamos directamente.
+            # --------------------------------------------------------
             else:
-                # ------------------------------------------------------------
-                # Si ya confirmó el tipo, pero aún no hay coincidencia exacta,
-                # no volvemos a pedir "tipo de producto".
-                #
-                # Regla general:
-                # - El cliente ya eligió una rama del catálogo.
-                # - Si falta precisión para llegar a SKU, pasamos a preguntas
-                #   técnicas secuenciales.
-                # - Máximo 3 preguntas, una por turno.
-                # ------------------------------------------------------------
-                preguntas = []
+                res = await buscar_en_catalogo(query_tipo)
 
-                try:
-                    preguntas = _limpiar_preguntas_tecnicas(
-                        await generar_preguntas(query_e)
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "No fue posible generar preguntas tras confirmar tipo de producto: %s",
-                        e,
-                    )
-                    preguntas = []
+                if debe_intentar_enriquecimiento(res):
+                    res = await enriquecer_y_buscar(query_tipo)
 
-                if preguntas:
-                    necesidad_ctx = _crear_ctx_preguntas_secuenciales(
-                        texto_original=query_e,
-                        preguntas=preguntas,
+                contexto_extra, nueva_etapa, necesidad_ctx = (
+                    construir_respuesta_desde_resultado(
+                        res=res,
+                        cliente=cliente,
+                        productos_acumulados=productos_acumulados,
+                        desde="tipo_producto_sin_campos",
                         necesidad_ctx_base={
-                            "texto_original": query_e,
-                            "query_evaluada": query_e,
-                            "tipos_detectados": necesidad_ctx.get("tipos_detectados", []),
+                            "texto_original": query_tipo,
+                            "query_evaluada": query_tipo,
+                            "texto_producto_base": texto_original,
+                            "tipos_detectados": tipos_detectados_previos,
                             "tipo_confirmado": tipo_confirmado,
+                            "flujo_campos_dinamicos": False,
                         },
                     )
+                )
 
-                    contexto_extra = _marcar_respuesta_segura(
-                        _respuesta_pregunta_tecnica_unica(
-                            preguntas[0],
-                            primera=True,
-                        )
-                    )
-
-                    nueva_etapa = "descubrimiento"
-
-                else:
-                    contexto_extra = _marcar_respuesta_segura(
-                        "Ya tengo claro el tipo de producto. Para llegar a una referencia más precisa, "
-                        "necesito una especificación adicional. ¿Qué rango, aplicación o condición de instalación debe cumplir?"
-                    )
-
-                    nueva_etapa = "descubrimiento"
-                    necesidad_ctx = {
-                        "texto_original": query_e,
-                        "query_evaluada": query_e,
-                        "tipos_detectados": necesidad_ctx.get("tipos_detectados", []),
-                        "tipo_confirmado": tipo_confirmado,
-                    }
         # Caso 3A: preguntas técnicas secuenciales
         # NIA tiene hasta 3 preguntas guardadas, pero solo muestra una por turno.
         elif etapa == "descubrimiento" and necesidad_ctx.get("preguntas_tecnicas"):
@@ -2960,12 +3251,59 @@ async def procesar_turno(
                 }
 
             else:
-                # Ya respondieron las preguntas disponibles.
-                # Construimos una búsqueda enriquecida con la necesidad original
-                # y las respuestas técnicas del cliente.
-                query_e = " ".join(
-                    [texto_original] + respuestas_tecnicas
-                ).strip()
+                # ----------------------------------------------------
+                # Construir la consulta final
+                # ----------------------------------------------------
+                # Para preguntas dinámicas asociamos cada respuesta
+                # al nombre del campo real del catálogo.
+                # ----------------------------------------------------
+                if necesidad_ctx.get("flujo_campos_dinamicos"):
+                    campos_seleccionados_ctx = (
+                        necesidad_ctx.get(
+                            "campos_tecnicos_seleccionados",
+                            [],
+                        )
+                        or []
+                    )
+
+                    partes_query = [texto_original]
+
+                    for indice, respuesta_tecnica in enumerate(
+                        respuestas_tecnicas
+                    ):
+                        campo_nombre = ""
+
+                        if indice < len(campos_seleccionados_ctx):
+                            campo_info = (
+                                campos_seleccionados_ctx[indice]
+                            )
+
+                            if isinstance(campo_info, dict):
+                                campo_nombre = str(
+                                    campo_info.get("campo") or ""
+                                ).strip()
+
+                        if campo_nombre:
+                            partes_query.append(
+                                f"{campo_nombre}: "
+                                f"{respuesta_tecnica}"
+                            )
+                        else:
+                            partes_query.append(
+                                respuesta_tecnica
+                            )
+
+                    query_e = " ".join(
+                        parte
+                        for parte in partes_query
+                        if str(parte or "").strip()
+                    ).strip()
+
+                else:
+                    # Flujo tradicional existente.
+                    query_e = " ".join(
+                        [texto_original] + respuestas_tecnicas
+                    ).strip()
 
                 res = await buscar_en_catalogo(query_e)
 
@@ -2980,6 +3318,13 @@ async def procesar_turno(
                     necesidad_ctx_base={
                         "texto_original": texto_original,
                         "query_evaluada": query_e,
+                        "diagnostico_tecnico_completo": True,
+                        "flujo_campos_dinamicos": bool(
+                            necesidad_ctx.get(
+                                "flujo_campos_dinamicos",
+                                False,
+                            )
+                        ),
                     },
                 )
 
@@ -3086,52 +3431,128 @@ async def procesar_turno(
                     )
 
                 else:
-                    nec = await evaluar_necesidad(mensaje)
+                    # ------------------------------------------------
+                    # Necesidad técnica estructurada
+                    # ------------------------------------------------
+                    # Si el cliente ya indicó dos o más campos técnicos
+                    # explícitos, no debemos enviarlo al agente general
+                    # de preguntas.
+                    campos_declarados = extraer_campos_query(
+                        mensaje
+                    )
 
-                    if nec["clara"]:
-                        res = await buscar_en_catalogo(mensaje)
+                    campos_significativos = {
+                        nombre: valor
+                        for nombre, valor in (
+                            campos_declarados or {}
+                        ).items()
+                        if (
+                            nombre != "valor_tecnico"
+                            and str(valor or "").strip()
+                        )
+                    }
+
+                    if len(campos_significativos) >= 2:
+                        logger.info(
+                            "Necesidad técnica estructurada detectada: "
+                            "session=%s campos=%s",
+                            session_id,
+                            campos_significativos,
+                        )
+
+                        res = await buscar_en_catalogo(
+                            mensaje
+                        )
 
                         if debe_intentar_enriquecimiento(res):
-                            res = await enriquecer_y_buscar(mensaje)
+                            res = await enriquecer_y_buscar(
+                                mensaje
+                            )
 
-                        contexto_extra, nueva_etapa, necesidad_ctx = construir_respuesta_desde_resultado(
-                            res=res,
-                            cliente=cliente,
-                            productos_acumulados=productos_acumulados,
-                            desde="busqueda",
-                            necesidad_ctx_base={
-                                "texto_original": mensaje,
-                                "query_evaluada": mensaje,
-                            },
+                        contexto_extra, nueva_etapa, necesidad_ctx = (
+                            construir_respuesta_desde_resultado(
+                                res=res,
+                                cliente=cliente,
+                                productos_acumulados=productos_acumulados,
+                                desde="busqueda_tecnica_estructurada",
+                                necesidad_ctx_base={
+                                    "texto_original": mensaje,
+                                    "query_evaluada": mensaje,
+                                    "campos_declarados": campos_significativos,
+                                },
+                            )
                         )
 
                     else:
-                        preguntas = _limpiar_preguntas_tecnicas(nec.get("preguntas", []))
+                        # --------------------------------------------
+                        # Flujo tradicional
+                        # --------------------------------------------
+                        # Se mantiene para mensajes que todavía no
+                        # contienen suficientes datos técnicos.
+                        nec = await evaluar_necesidad(
+                            mensaje
+                        )
 
-                        if preguntas:
-                            necesidad_ctx = _crear_ctx_preguntas_secuenciales(
-                                texto_original=mensaje,
-                                preguntas=preguntas,
-                                necesidad_ctx_base={
-                                    "texto_original": mensaje,
-                                    "dominio": nec.get("dominio"),
-                                },
+                        if nec["clara"]:
+                            res = await buscar_en_catalogo(
+                                mensaje
                             )
 
-                            contexto_extra = _marcar_respuesta_segura(
-                                _respuesta_pregunta_tecnica_unica(
-                                    preguntas[0],
-                                    primera=True,
+                            if debe_intentar_enriquecimiento(res):
+                                res = await enriquecer_y_buscar(
+                                    mensaje
+                                )
+
+                            contexto_extra, nueva_etapa, necesidad_ctx = (
+                                construir_respuesta_desde_resultado(
+                                    res=res,
+                                    cliente=cliente,
+                                    productos_acumulados=productos_acumulados,
+                                    desde="busqueda",
+                                    necesidad_ctx_base={
+                                        "texto_original": mensaje,
+                                        "query_evaluada": mensaje,
+                                    },
                                 )
                             )
-                        else:
-                            contexto_extra = _marcar_respuesta_segura(
-                                "Necesito un poco más de información para buscar la opción adecuada. "
-                                "¿Puedes indicarme la aplicación o especificación principal?"
-                            )
-                            necesidad_ctx = {"texto_original": mensaje}
 
-                        nueva_etapa = "descubrimiento"
+                        else:
+                            preguntas = _limpiar_preguntas_tecnicas(
+                                nec.get("preguntas", [])
+                            )
+
+                            if preguntas:
+                                necesidad_ctx = (
+                                    _crear_ctx_preguntas_secuenciales(
+                                        texto_original=mensaje,
+                                        preguntas=preguntas,
+                                        necesidad_ctx_base={
+                                            "texto_original": mensaje,
+                                            "dominio": nec.get("dominio"),
+                                        },
+                                    )
+                                )
+
+                                contexto_extra = _marcar_respuesta_segura(
+                                    _respuesta_pregunta_tecnica_unica(
+                                        preguntas[0],
+                                        primera=True,
+                                    )
+                                )
+
+                            else:
+                                contexto_extra = _marcar_respuesta_segura(
+                                    "Necesito un poco más de información "
+                                    "para buscar la opción adecuada. "
+                                    "¿Puedes indicarme la aplicación o "
+                                    "especificación principal?"
+                                )
+
+                                necesidad_ctx = {
+                                    "texto_original": mensaje
+                                }
+
+                            nueva_etapa = "descubrimiento"
 
 
         # Intenciones comerciales transversales
