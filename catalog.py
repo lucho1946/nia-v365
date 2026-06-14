@@ -157,17 +157,6 @@ PALABRAS_ENVOLTURA_BUSQUEDA = {
 def _normalizar_query_busqueda_catalogo(valor: str) -> str:
     """
     Elimina únicamente la envoltura conversacional de una consulta.
-
-    Ejemplos:
-        "necesito un termometro"
-        -> "termometro"
-
-        "quiero cotizar un transmisor de temperatura"
-        -> "transmisor temperatura"
-
-        "termometro sin certificado"
-        -> "termometro sin certificado"
-
     Importante:
     - No elimina 'con' ni 'sin', porque pueden expresar requisitos técnicos.
     - No elimina marcas, materiales, unidades, códigos o especificaciones.
@@ -191,6 +180,42 @@ def _normalizar_query_busqueda_catalogo(valor: str) -> str:
 
     return " ".join(tokens_utiles).strip()
 
+def limpiar_envoltura_conversacional(valor: str) -> str:
+    """
+    Elimina únicamente palabras conversacionales ubicadas al inicio
+    del mensaje, preservando literalmente el resto de la necesidad.
+
+    Diferencia frente a _normalizar_query_busqueda_catalogo:
+    - No normaliza unidades.
+    - No elimina números cortos.
+    - No elimina 4-20 mA, 0-10 V, 1/2 NPT u otras especificaciones.
+    - Solo consume tokens de envoltura situados al comienzo.
+    """
+    texto_original = _clean_text(valor)
+
+    if not texto_original:
+        return ""
+
+    tokens_originales = texto_original.split()
+    indice_inicio = 0
+
+    while indice_inicio < len(tokens_originales):
+        token_normalizado = _normalize_text(
+            tokens_originales[indice_inicio]
+        )
+
+        if token_normalizado not in PALABRAS_ENVOLTURA_BUSQUEDA:
+            break
+
+        indice_inicio += 1
+
+    texto_limpio = " ".join(
+        tokens_originales[indice_inicio:]
+    ).strip()
+
+    # Fallback defensivo:
+    # nunca devolvemos vacío si originalmente existía texto.
+    return texto_limpio or texto_original
 
 def _first_value(prod: dict, keys: list[str], default: Any = "") -> Any:
     """
