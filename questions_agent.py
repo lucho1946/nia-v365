@@ -1,7 +1,7 @@
 """
 questions_agent.py — Agente de 3 preguntas estratégicas v2
 Basado en los campos técnicos reales del catálogo ViaIndustrial
-(289.017 productos · separador ¦ en desc_larga) + OpenAI GPT-4o-mini
+(catálogo real · separadores ■, •, ▪ y compatibilidad histórica ¦)
 
 LÓGICA DE 3 ESCENARIOS:
   Escenario 1: Cliente tiene código/referencia/marca/características → 0-2 preguntas
@@ -340,6 +340,490 @@ FALLBACKS = {
         "¿Qué señal de salida necesitas y el área es clasificada?",
     ],
 }
+
+# ─── Preguntas dinámicas desde campos reales del catálogo ────────────────────
+
+VALORES_EJEMPLO_NO_UTILES = {
+    "",
+    "-",
+    "--",
+    "no",
+    "n/a",
+    "na",
+    "no aplica",
+    "sin dato",
+    "sin datos",
+    "no disponible",
+    "ninguno",
+    "ninguna",
+}
+
+
+def _humanizar_nombre_campo(campo: str) -> str:
+    """
+    Convierte el nombre normalizado del catálogo en una etiqueta legible.
+
+    No cambia el significado del campo.
+    Solo recupera tildes y mejora la presentación.
+    """
+    campo_norm = _normalizar_texto_simple(campo)
+
+    reemplazos = {
+        "conexion": "conexión",
+        "presion": "presión",
+        "alimentacion": "alimentación",
+        "resolucion": "resolución",
+        "precision": "precisión",
+        "dimension": "dimensión",
+        "dimensiones": "dimensiones",
+        "tamano": "tamaño",
+        "senal": "señal",
+        "proteccion": "protección",
+        "comunicacion": "comunicación",
+    }
+
+    palabras = [
+        reemplazos.get(palabra, palabra)
+        for palabra in campo_norm.split()
+    ]
+
+    return " ".join(palabras).strip()
+
+
+def _agregar_opcion_unica(
+    opciones: list[str],
+    vistos: set[str],
+    valor: str,
+) -> None:
+    """
+    Agrega una opción sin duplicados y limita valores excesivamente largos.
+    """
+    valor = re.sub(r"\s+", " ", str(valor or "")).strip()
+
+    if not valor:
+        return
+
+    valor_norm = _normalizar_texto_simple(valor)
+
+    if not valor_norm:
+        return
+
+    if valor_norm in VALORES_EJEMPLO_NO_UTILES:
+        return
+
+    if valor_norm in vistos:
+        return
+
+    if len(valor) > 85:
+        valor = valor[:82].rstrip() + "..."
+
+    vistos.add(valor_norm)
+    opciones.append(valor)
+
+
+def _extraer_opciones_catalogo(
+    campo_info: dict,
+    max_opciones: int = 3,
+) -> list[str]:
+    """
+    Extrae opciones cortas desde los ejemplos reales del catálogo.
+
+    Casos especiales:
+    - Para 'tipo de entrada', convierte valores compuestos como:
+        RTD: Pt100 | Termocupla: J, K
+      en opciones:
+        RTD, Termocupla
+
+    No inventa opciones.
+    """
+    if not isinstance(campo_info, dict):
+        return []
+
+    campo = _normalizar_texto_simple(
+        campo_info.get("campo") or ""
+    )
+
+    ejemplos = campo_info.get("ejemplos") or []
+
+    opciones: list[str] = []
+    vistos: set[str] = set()
+
+    for ejemplo in ejemplos:
+        if isinstance(ejemplo, dict):
+            valor = ejemplo.get("valor")
+        else:
+            valor = ejemplo
+
+        valor = re.sub(r"\s+", " ", str(valor or "")).strip()
+
+        if not valor:
+            continue
+
+        # --------------------------------------------------------
+        # Tipo de entrada
+        # --------------------------------------------------------
+        # En este campo nos interesan las clases de entrada:
+        # RTD, Termocupla, etc., no toda la lista interna de sensores.
+        if campo == "tipo de entrada":
+            fragmentos = re.split(r"\s*\|\s*", valor)
+
+            for fragmento in fragmentos:
+                fragmento = fragmento.strip()
+
+                if ":" not in fragmento:
+                    continue
+
+                etiqueta, contenido = fragmento.split(":", 1)
+
+                etiqueta = etiqueta.strip()
+                contenido_norm = _normalizar_texto_simple(contenido)
+
+                if (
+                    not etiqueta
+                    or not contenido_norm
+                    or contenido_norm in VALORES_EJEMPLO_NO_UTILES
+                ):
+                    continue
+
+                _agregar_opcion_unica(
+                    opciones,
+                    vistos,
+                    etiqueta,
+                )
+
+                if len(opciones) >= max_opciones:
+                    return opciones
+
+            continue
+
+        # --------------------------------------------------------
+        # Campos generales
+        # --------------------------------------------------------
+        _agregar_opcion_unica(
+            opciones,
+            vistos,
+            valor,
+        )
+
+        if len(opciones) >= max_opciones:
+            return opciones
+
+    return opciones
+
+
+def _formatear_lista_opciones(opciones: list[str]) -> str:
+    """
+    Convierte una lista en texto natural en español.
+    """
+    opciones = [
+        str(opcion).strip()
+        for opcion in opciones or []
+        if str(opcion).strip()
+    ]
+
+    if not opciones:
+        return ""
+
+    if len(opciones) == 1:
+        return opciones[0]
+
+    if len(opciones) == 2:
+        return f"{opciones[0]} o {opciones[1]}"
+
+    return ", ".join(opciones[:-1]) + f" o {opciones[-1]}"
+
+
+def _pregunta_base_para_campo(campo: str) -> str:
+    """
+    Genera una pregunta determinística según una dimensión técnica general.
+
+    Importante:
+    - No contiene familias de producto específicas.
+    - Trabaja con atributos industriales transversales.
+    - Nunca inventa valores.
+    """
+    campo_norm = _normalizar_texto_simple(campo)
+    campo_humano = _humanizar_nombre_campo(campo_norm)
+
+    if campo_norm == "tipo de entrada":
+        return "¿Qué tipo de entrada necesita el equipo?"
+
+    if campo_norm == "salida":
+        return "¿Qué tipo de salida necesita?"
+
+    if "conexion" in campo_norm and "orificio" in campo_norm:
+        return "¿Qué conexión y tamaño de orificio necesita?"
+
+    if "conexion" in campo_norm:
+        return "¿Qué tipo y tamaño de conexión necesita?"
+
+    if campo_norm == "rango":
+        return "¿Qué rango de operación necesita?"
+
+    if "rango" in campo_norm:
+        return f"¿Qué {campo_humano} necesita?"
+
+    if campo_norm == "presion":
+        return "¿Qué rango de presión debe manejar?"
+
+    if "temperatura" in campo_norm:
+        return "¿Qué rango de temperatura debe manejar?"
+
+    if campo_norm in {"dimensiones", "dimension", "tamano"}:
+        return "¿Qué dimensiones o tamaño necesita?"
+
+    if "alimentacion" in campo_norm or "voltaje" in campo_norm:
+        return "¿Qué alimentación eléctrica tiene disponible?"
+
+    if (
+        "resolucion" in campo_norm
+        or "exactitud" in campo_norm
+        or "precision" in campo_norm
+    ):
+        return f"¿Qué {campo_humano} necesita?"
+
+    if "material" in campo_norm or campo_norm == "cuerpo":
+        return "¿Qué material de construcción necesita?"
+
+    if "proteccion" in campo_norm:
+        return "¿Qué grado de protección necesita?"
+
+    if "protocolo" in campo_norm or "comunicacion" in campo_norm:
+        return "¿Qué protocolo o tipo de comunicación necesita?"
+
+    return f"¿Qué valor necesita para {campo_humano}?"
+
+
+CAMPOS_CON_OPCIONES_BREVES = {
+    "tipo de entrada",
+    "salida",
+    "protocolo",
+    "comunicacion",
+    "material",
+    "cuerpo",
+    "tipo",
+}
+
+
+def _campo_admite_opciones_breves(campo: str) -> bool:
+    """
+    Decide si conviene mostrar opciones al cliente.
+
+    Los campos categóricos pueden mostrar ejemplos reales.
+
+    Los campos continuos, como rango, presión, dimensiones,
+    temperatura o alimentación, se preguntan de forma abierta.
+    """
+    campo_norm = _normalizar_texto_simple(campo)
+
+    if campo_norm in CAMPOS_CON_OPCIONES_BREVES:
+        return True
+
+    if "protocolo" in campo_norm:
+        return True
+
+    if "comunicacion" in campo_norm:
+        return True
+
+    if "material" in campo_norm:
+        return True
+
+    return False
+
+
+def _compactar_opcion_para_pregunta(
+    campo: str,
+    opcion: str,
+) -> str:
+    """
+    Reduce una opción técnica extensa sin cambiar su significado.
+
+    Ejemplo:
+        4-20 mA (2 hilos) + HART
+        permanece completa.
+
+        Se eliminan espacios repetidos y textos excesivamente largos.
+    """
+    campo_norm = _normalizar_texto_simple(campo)
+
+    opcion = re.sub(
+        r"\s+",
+        " ",
+        str(opcion or ""),
+    ).strip()
+
+    if not opcion:
+        return ""
+
+    # En salidas compuestas evitamos repetir detalles secundarios
+    # cuando ya existe un protocolo diferenciador.
+    if campo_norm == "salida" and "+" in opcion:
+        opcion = re.sub(
+            r"\s*\(2\s*hilos?\)\s*(?=\+)",
+            " ",
+            opcion,
+            flags=re.IGNORECASE,
+        )
+
+        opcion = re.sub(r"\s+", " ", opcion).strip()
+
+    # Las opciones demasiado largas no son adecuadas para una pregunta.
+    if len(opcion) > 60:
+        return ""
+
+    return opcion
+
+
+def _formatear_opciones_breves(
+    campo: str,
+    opciones: list[str],
+) -> str:
+    """
+    Construye una lista breve y permite que el cliente indique otra opción.
+
+    Ejemplos:
+        Termocupla, RTD u otra
+
+        4-20 mA, 4-20 mA + HART o Profibus
+    """
+    opciones_limpias = []
+    vistos = set()
+
+    for opcion in opciones or []:
+        opcion_limpia = _compactar_opcion_para_pregunta(
+            campo,
+            opcion,
+        )
+
+        if not opcion_limpia:
+            continue
+
+        opcion_norm = _normalizar_texto_simple(
+            opcion_limpia
+        )
+
+        if not opcion_norm or opcion_norm in vistos:
+            continue
+
+        vistos.add(opcion_norm)
+        opciones_limpias.append(opcion_limpia)
+
+        if len(opciones_limpias) >= 3:
+            break
+
+    if not opciones_limpias:
+        return ""
+
+    return ", ".join(opciones_limpias) + " u otra"
+
+
+def generar_pregunta_campo_dinamico(
+    texto_producto: str,
+    campo_info: dict,
+) -> str:
+    """
+    Genera UNA pregunta breve basada en un campo real del catálogo.
+
+    Reglas:
+    - El backend ya decidió qué campo preguntar.
+    - No usa OpenAI para decidir campos ni opciones.
+    - Solo muestra opciones en campos categóricos.
+    - Los campos continuos se preguntan de forma abierta.
+    - No inventa valores.
+    """
+    if not isinstance(campo_info, dict):
+        return "¿Qué especificación técnica adicional necesita?"
+
+    campo = str(
+        campo_info.get("campo") or ""
+    ).strip()
+
+    if not campo:
+        return "¿Qué especificación técnica adicional necesita?"
+
+    pregunta_base = _pregunta_base_para_campo(campo)
+
+    # Rangos, dimensiones, presión, temperatura, alimentación y otros
+    # valores continuos deben responderse libremente.
+    if not _campo_admite_opciones_breves(campo):
+        return pregunta_base.strip()
+
+    opciones_catalogo = _extraer_opciones_catalogo(
+        campo_info,
+        max_opciones=3,
+    )
+
+    opciones_texto = _formatear_opciones_breves(
+        campo,
+        opciones_catalogo,
+    )
+
+    if not opciones_texto:
+        return pregunta_base.strip()
+
+    # Eliminamos únicamente el signo final para integrar las opciones
+    # dentro de la misma pregunta.
+    pregunta_sin_cierre = pregunta_base.rstrip().rstrip("?")
+
+    return (
+        f"{pregunta_sin_cierre}: "
+        f"{opciones_texto}?"
+    )
+
+
+def generar_preguntas_campos_dinamicos(
+    texto_producto: str,
+    campos_seleccionados: list[dict],
+    max_preguntas: int = 2,
+) -> list[str]:
+    """
+    Convierte los campos seleccionados por catalog.py en preguntas.
+
+    Reglas:
+    - máximo dos preguntas técnicas después de confirmar el tipo;
+    - una pregunta por campo;
+    - no repite preguntas;
+    - no inventa campos ni opciones;
+    - conserva el agente tradicional como fallback independiente.
+    """
+    if max_preguntas <= 0:
+        return []
+
+    preguntas = []
+    preguntas_vistas = set()
+
+    for campo_info in campos_seleccionados or []:
+        pregunta = generar_pregunta_campo_dinamico(
+            texto_producto=texto_producto,
+            campo_info=campo_info,
+        )
+
+        pregunta_norm = _normalizar_texto_simple(pregunta)
+
+        if not pregunta_norm:
+            continue
+
+        if pregunta_norm in preguntas_vistas:
+            continue
+
+        preguntas_vistas.add(pregunta_norm)
+        preguntas.append(pregunta)
+
+        if len(preguntas) >= max_preguntas:
+            break
+
+    logger.info(
+        "Preguntas dinámicas generadas: producto='%s' campos=%s preguntas=%s",
+        str(texto_producto or "")[:100],
+        [
+            campo.get("campo")
+            for campo in campos_seleccionados or []
+            if isinstance(campo, dict)
+        ],
+        preguntas,
+    )
+
+    return preguntas
 
 # ─── Función principal ────────────────────────────────────────────────────────
 async def generar_preguntas(texto_cliente: str) -> list:
