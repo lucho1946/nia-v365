@@ -54,6 +54,7 @@ from catalog import (
     filtrar_candidatos_coherentes,
     campos_disponibles_de,
     ordenar_campos_por_prioridad,
+    limpiar_envoltura_conversacional,
 )
 from product_matcher import validar_compatibilidad_producto
 from file_processor import procesar_archivo
@@ -973,18 +974,17 @@ async def buscar_en_catalogo(texto: str) -> dict:
     """
     logger.info("Búsqueda catálogo solicitada: '%s'", texto[:100])
 
-    # ------------------------------------------------------------
-    # Campos técnicos declarados en el mensaje original
-    # ------------------------------------------------------------
-    # El texto original es la fuente de verdad técnica.
-    #
-    # El normalizador LLM puede generar consultas más cortas para
-    # retrieval, pero no puede eliminar campos como:
-    # - entrada
-    # - salida
-    # - rango
-    # - dimensiones
-    # - conexión
+    texto_matching = (
+        limpiar_envoltura_conversacional(texto)
+        or str(texto or "").strip()
+    )
+
+    logger.info(
+        "Texto matching: original='%s' validacion='%s'",
+        texto,
+        texto_matching,
+    )
+
     campos_originales = extraer_campos_query(texto)
 
     campos_originales_significativos = {
@@ -1087,10 +1087,10 @@ async def buscar_en_catalogo(texto: str) -> dict:
         }
 
     ok_textual, prod_textual = evaluar_coincidencia(
-    resultados,
-    texto,
-    campos=len(campos_query) if campos_query else 1,
-    campos_query=campos_query,
+        resultados,
+        texto_matching,
+        campos=len(campos_query) if campos_query else 1,
+        campos_query=campos_query,
     )
 
     if ok_textual and prod_textual:
@@ -1182,7 +1182,7 @@ async def buscar_en_catalogo(texto: str) -> dict:
     # Si el candidato determinístico no alcanza la evidencia requerida,
     # conservamos el product_matcher como segunda capa de validación.
     decision = await validar_compatibilidad_producto(
-        necesidad_cliente=texto,
+        necesidad_cliente=texto_matching,
         candidatos=resultados,
         contexto_tecnico={
             "query_catalogo": query_usada,
@@ -1204,7 +1204,7 @@ async def buscar_en_catalogo(texto: str) -> dict:
     # No quemamos productos.
     # No aplica si hay campos técnicos, porque ahí sí conviene validar.
     if _debe_promover_related_a_exacto(
-        texto_cliente=texto,
+        texto_cliente=texto_matching,
         producto=producto,
         estado_match=estado_match,
         campos_query=campos_query,
