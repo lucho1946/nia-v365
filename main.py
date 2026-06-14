@@ -364,6 +364,25 @@ async def clasificar_mensaje(mensaje: str, etapa: str) -> dict:
             "razon": "cantidad numérica",
         }
 
+    # ------------------------------------------------------------
+    # Medio de pago explícito
+    # ------------------------------------------------------------
+    # Solo se aplica cuando NIA ya está en la etapa de pago.
+    # Evita enviar PSE, transferencia o tarjeta al clasificador LLM.
+    if etapa == "pago" and any(
+        medio in msg_lower
+        for medio in (
+            "pse",
+            "transferencia",
+            "tarjeta",
+        )
+    ):
+        return {
+            "tipo": "instruccion_comercial",
+            "confianza": 1.0,
+            "razon": "medio de pago explícito",
+        }
+
     if msg_lower.strip() in RESPUESTAS_CORTAS_COMERCIALES:
         return {
             "tipo": "instruccion_comercial",
@@ -1779,6 +1798,8 @@ def _es_confirmacion_afirmativa(texto: str) -> bool:
         "perfecto",
         "confirmo",
         "confirmado",
+        "listo",
+        "esta bien",
     }
 
     return t in afirmaciones_exactas
@@ -1871,6 +1892,21 @@ def _parece_nombre_simple(texto: str) -> Optional[str]:
         return None
 
     t = _normalizar_intencion(limpio)
+
+    # ------------------------------------------------------------
+    # Guardrail: respuestas cortas comerciales no son nombres
+    # ------------------------------------------------------------
+    #
+    # RESPUESTAS_CORTAS_COMERCIALES ya es la fuente central para
+    # estas expresiones, por lo que evitamos mantener otra lista
+    # incompleta dentro del extractor de nombres.
+    if (
+        t in RESPUESTAS_CORTAS_COMERCIALES
+        or t in PALABRAS_FIN
+        or _es_confirmacion_afirmativa(limpio)
+        or _es_confirmacion_negativa(limpio)
+    ):
+        return None
 
     bloqueados = PALABRAS_SALUDO | PALABRAS_FIN | {
         "si",
@@ -2097,80 +2133,124 @@ def _respuesta_siguiente_dato_comercial(
     etapa_objetivo: str = "cotizacion",
 ) -> tuple[str, str]:
     """
-    Decide el siguiente dato comercial que NIA debe pedir.
+    Decide qué información comercial debe solicitar NIA.
 
-    Regla comercial actualizada:
-    - Para cotización SOLO se pide nombre y correo.
-    - Después del correo, NIA deja la solicitud lista para asesor/vendedor.
-    - NIA NO pide razón social, NIT ni RUT en cotización.
-    - Razón social, NIT y RUT solo se piden si la etapa objetivo es proforma.
-
-    Esto implementa la barrera solicitada:
-    cotización enviada/aprobada primero, proforma después.
+    Reglas v3.66:
+    - Cotización: nombre y correo se solicitan en una sola pregunta.
+    - Proforma: razón social, NIT y RUT se solicitan en una sola pregunta.
+    - No se afirma que el documento fue enviado automáticamente.
+    - Después de reunir los datos, NIA espera confirmación externa.
     """
+    cliente = dict(cliente or {})
 
-    nombre = (cliente.get("nombre") or "").strip()
+    nombre = str(cliente.get("nombre") or "").strip()
+    email = str(cliente.get("email") or "").strip()
+    empresa = str(cliente.get("empresa") or "").strip()
+    nit = str(cliente.get("nit") or "").strip()
+    rut = str(cliente.get("rut") or "").strip()
 
     # ============================================================
     # ETAPA COTIZACIÓN
     # ============================================================
-    if etapa_objetivo in {"cotizacion", "calificacion", "confirmando_cierre"}:
-        if not cliente.get("nombre"):
-            return "¿A nombre de quién va la cotización?", "cotizacion"
+    if etapa_objetivo in {
+        "cotizacion",
+        "calificacion",
+        "confirmando_cierre",
+    }:
+        falta_nombre = not nombre
+        falta_email = not email
 
-        if not cliente.get("email"):
+        # Don Andrés: nombre y correo en una sola pregunta.
+        if falta_nombre and falta_email:
             return (
-                f"Gracias, {nombre}. ¿Cuál es el correo electrónico para enviar la cotización?",
+                "Para preparar la cotización, indícame por favor "
+                "tu nombre y el correo electrónico donde deseas recibirla.",
                 "cotizacion",
             )
 
-        # Punto final de la etapa de cotización.
-        # No pedimos empresa, NIT ni RUT aquí.
+        if falta_nombre:
+            return (
+                "Ya tengo el correo. ¿A nombre de quién debe quedar la cotización?",
+                "cotizacion",
+            )
+
+        if falta_email:
+            return (
+                f"Gracias, {nombre}. ¿Cuál es el correo electrónico "
+                "donde deseas recibir la cotización?",
+                "cotizacion",
+            )
+
+        # No afirmamos que la cotización ya fue creada o enviada.
         return (
-            f"Perfecto, {nombre}, ya quedé con tu solicitud. En breve recibirás la cotización en tu correo.",
+            f"Perfecto, {nombre}. Ya tengo los datos de contacto "
+            "para gestionar la cotización. Cuando la recibas, "
+            "confírmame si cumple con lo que necesitas técnicamente.",
             "cotizacion_lista",
         )
 
     # ============================================================
     # ETAPA PROFORMA
     # ============================================================
-    # Esta etapa solo debe activarse cuando exista una señal futura:
-    # - vendedor confirmó que envió la cotización;
-    # - cliente confirmó que cumple técnicamente.
-    #==============================================================
-
     if etapa_objetivo == "proforma":
-        if not cliente.get("empresa"):
+        falta_empresa = not empresa
+        falta_nit = not nit
+
+        # "pendiente" no equivale a un RUT recibido.
+        falta_rut = not rut or rut == "pendiente"
+
+        # Don Andrés: pedir los datos en una sola pregunta.
+        if falta_empresa and falta_nit and falta_rut:
             return (
-                f"Perfecto, {nombre or 'cliente'}. Para preparar la proforma, "
-                "¿cuál es la razón social de tu empresa?",
+                "Para preparar la proforma, envíame en un solo mensaje "
+                "la razón social, el NIT y el RUT de la empresa. "
+                "Puedes adjuntar el RUT o indicar que ya lo compartiste.",
                 "proforma",
             )
 
-        if not cliente.get("nit"):
-            return "Gracias. ¿Cuál es el NIT de la empresa?", "proforma"
+        faltantes = []
 
-        # ------------------------------------------------------------
-        # RUT NO BLOQUEANTE
-        # ------------------------------------------------------------
-        # Regla de negocio:
-        # - NIT identifica tributariamente al cliente.
-        # - RUT es soporte/documento tributario.
-        # - Para no frenar el flujo comercial, si ya tenemos empresa
-        #   y NIT, dejamos la proforma lista para revisión del asesor.
-        # - Si el cliente ya compartió RUT, se conserva en cliente["rut"].
-        if not cliente.get("rut"):
-            cliente["rut"] = "pendiente"
+        if falta_empresa:
+            faltantes.append("la razón social")
 
+        if falta_nit:
+            faltantes.append("el NIT")
+
+        if falta_rut:
+            faltantes.append("el RUT")
+
+        if faltantes:
+            if len(faltantes) == 1:
+                texto_faltantes = faltantes[0]
+            elif len(faltantes) == 2:
+                texto_faltantes = (
+                    f"{faltantes[0]} y {faltantes[1]}"
+                )
+            else:
+                texto_faltantes = (
+                    f"{', '.join(faltantes[:-1])} "
+                    f"y {faltantes[-1]}"
+                )
+
+            return (
+                f"Para completar la solicitud de proforma todavía necesito "
+                f"{texto_faltantes}. Puedes enviarlo en un solo mensaje.",
+                "proforma",
+            )
+
+        # No afirmamos que Bitrix o un asesor ya la envió.
         return (
-            f"Perfecto, {nombre or 'cliente'}, ya tengo todos los datos. En breve recibirás la proforma.",
+            f"Perfecto, {nombre or 'cliente'}. Ya tengo los datos "
+            "necesarios para gestionar la proforma. Cuando la recibas, "
+            "confírmame si deseas proceder con el pago.",
             "proforma_lista",
         )
 
-
-    # Fallback seguro: si llega una etapa desconocida, no avanzar a proforma.
+    # Fallback seguro.
     return (
-        "Perfecto, ya dejé la solicitud lista para que un asesor revise disponibilidad, precio y condiciones.",
+        "Ya tengo la información comercial disponible. "
+        "Continuaré únicamente cuando exista una confirmación "
+        "real del siguiente documento o etapa.",
         "cotizacion_lista",
     )
 
@@ -2385,11 +2465,12 @@ def _manejar_estado_comercial_prioritario(
     # ============================================================
     if etapa == "proforma_enviada":
         if _es_confirmacion_afirmativa(mensaje):
+            necesidad_ctx["proforma_aprobada_cliente"] = True
             return {
                 "handled": True,
                 "respuesta": (
-                    "Perfecto. Puedes continuar con el pago por transferencia, PSE o tarjeta. "
-                    "Un asesor confirmará el pago y cerrará el proceso."
+                    "Perfecto. ¿Qué medio de pago prefieres: "
+                    "PSE, transferencia o tarjeta?"
                 ),
                 "etapa": "pago",
                 "cliente": cliente,
@@ -2414,6 +2495,50 @@ def _manejar_estado_comercial_prioritario(
             "handled": True,
             "respuesta": "¿Deseas proceder con el pago?",
             "etapa": "proforma_enviada",
+            "cliente": cliente,
+            "necesidad_ctx": necesidad_ctx,
+            "productos_acumulados": productos_acumulados,
+        }
+
+    # ============================================================
+    # Selección del medio de pago
+    # ============================================================
+    if etapa == "pago":
+        texto_pago = _normalizar_intencion(mensaje)
+
+        medio_pago = None
+
+        if "pse" in texto_pago:
+            medio_pago = "PSE"
+        elif "transferencia" in texto_pago:
+            medio_pago = "transferencia"
+        elif "tarjeta" in texto_pago:
+            medio_pago = "tarjeta"
+
+        if not medio_pago:
+            return {
+                "handled": True,
+                "respuesta": (
+                    "Para continuar, indícame cuál medio de pago prefieres: "
+                    "PSE, transferencia o tarjeta."
+                ),
+                "etapa": "pago",
+                "cliente": cliente,
+                "necesidad_ctx": necesidad_ctx,
+                "productos_acumulados": productos_acumulados,
+            }
+
+        necesidad_ctx["medio_pago"] = medio_pago
+        necesidad_ctx["medio_pago_confirmado"] = True
+
+        return {
+            "handled": True,
+            "respuesta": (
+                f"Perfecto. Registré {medio_pago} como medio de pago preferido. "
+                "Continúa únicamente mediante el canal oficial indicado "
+                "en la proforma."
+            ),
+            "etapa": "pago",
             "cliente": cliente,
             "necesidad_ctx": necesidad_ctx,
             "productos_acumulados": productos_acumulados,
